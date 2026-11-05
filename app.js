@@ -3,10 +3,9 @@
 
 /* ==========================================================================
    CONFIGURAÇÃO DA PLANILHA NO GOOGLE SHEETS
-   Cole abaixo a URL do seu App da Web entre as aspas:
    ========================================================================== */
 var URL_GOOGLE_SCRIPT = "https://script.google.com/macros/s/AKfycby8thnuRK9J_ScgTCqo3g8QWRFfArN8Zdy-KPgrOvQCydR3A6P70kMikQhjNH3X3Xi3YA/exec";
-var SENHA_SERVIDOR = "1234"; // Senha configurada no seu Apps Script
+var SENHA_SERVIDOR = "1234";
 
 var KEY="conferencia-carga-v1";
 var app=document.getElementById("app");
@@ -228,7 +227,7 @@ function buildRecord(){
   return {id:S.orderId||uid(),conferente:(S.conferente||"").trim(),date:todayStr(),hora:nowHour(),ts:Date.now(),order:S.orderName||"Sem identificação",guiaId:S.guiaId||"",complete:ok,clients:clients};
 }
 
-/* ENVIO PARA O GOOGLE SHEETS (BANCO DE DADOS EM NUVEM) */
+/* ENVIO E CONSULTA NO GOOGLE SHEETS (BANCO DE DADOS EM NUVEM) */
 function enviarParaGoogleSheets(rec) {
   if (!URL_GOOGLE_SCRIPT) return;
   recClients(rec).forEach(function(c) {
@@ -262,13 +261,31 @@ function enviarParaGoogleSheets(rec) {
   });
 }
 
+function buscarDoGoogleSheets(cb) {
+  if (!URL_GOOGLE_SCRIPT) return cb && cb([]);
+  fetch(URL_GOOGLE_SCRIPT, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain" },
+    body: JSON.stringify({ acao: "buscar", senha: SENHA_SERVIDOR })
+  })
+  .then(function(res){ return res.json(); })
+  .then(function(res){
+    if (res.status === "sucesso" && Array.isArray(res.dados)) {
+      cb(res.dados);
+    } else {
+      cb([]);
+    }
+  })
+  .catch(function(){ cb([]); });
+}
+
 function finalize(){
   var rec=buildRecord(),jobs=[];
   recClients(rec).forEach(function(c){c.items.forEach(function(it){it.regs.forEach(function(r){
     if(typeof r.foto==="string"&&r.foto)jobs.push(fetch(r.foto).then(function(x){return x.blob();}).then(function(b){r.foto=b;}));
   });});});
   Promise.all(jobs).then(function(){
-    enviarParaGoogleSheets(rec); // Envia para o banco de dados em nuvem
+    enviarParaGoogleSheets(rec);
     return dbPut(rec);
   }).then(function(){
     S={step:"setup",orderId:"",orderName:S.orderName,conferente:S.conferente,repConf:"",draft:S.draft,guiaId:S.guiaId,items:[],clients:[],openClient:null,editC:-1,busca:"",fil:"",openId:null,zoom:null,confirmReset:false,confirmFinal:false,reportDate:todayStr(),reportTo:todayStr()};
@@ -288,30 +305,97 @@ function openReport(){
   S.step="report";S.confirmReset=false;S.confirmFinal=false;S.openId=null;
   loadReport();window.scrollTo(0,0);
 }
+
 function loadReport(){
   var from=S.reportDate||todayStr(),to=S.reportTo||from,tk=++reportToken;
   report={loading:true,recs:[],err:"",names:[]};
   render();
-  dbAll().then(function(all){
+
+  buscarDoGoogleSheets(function(linhasPlanilha){
     if(tk!==reportToken)return;
-    report.recs=(all||[]).filter(function(r){return r.kind!=="guia"&&r.date>=from&&r.date<=to;}).sort(function(a,b){return a.ts-b.ts;}).map(function(r){
-      var cls=recClients(r).map(function(c){
-        return {name:c.name||"",fantasia:c.fantasia||"",nfs:c.nfs||"",items:c.items.map(function(i){
-          return {name:i.name,unit:i.unit||"",ordered:i.ordered,loaded:i.loaded,falta:i.falta,nfotos:(i.regs||[]).filter(function(x){return x.foto;}).length};
-        })};
+    
+    // Se encontrou dados na planilha em nuvem, sincroniza
+    if(linhasPlanilha && linhasPlanilha.length > 1) {
+      var recsMap = {};
+      // Pula o cabeçalho (linha 0)
+      for(var i=1; i<linhasPlanilha.length; i++) {
+        var row = linhasPlanilha[i];
+        if(!row || row.length < 10) continue;
+        
+        var rOrdem = row[0], rCliente = row[1], rNfs = row[2], rSit = row[3];
+        var rProds = row[4], rComp = row[5], rFalta = row[6];
+        var rConf = row[7], rData = row[8], rHora = row[9];
+        
+        // Converte data DD/MM/AAAA para AAAA-MM-DD
+        var partsData = String(rData).split("/");
+        var dateISO = partsData.length===3 ? partsData[2]+"-"+partsData[1]+"-"+partsData[0] : rData;
+        
+        if(dateISO < from || dateISO > to) continue;
+        
+        var idKey = rOrdem + "_" + dateISO + "_" + rHora;
+        if(!recsMap[idKey]) {
+          recsMap[idKey] = {
+            id: idKey,
+            date: dateISO,
+            hora: rHora,
+            conf: rConf,
+            order: rOrdem,
+            complete: true,
+            clients: []
+          };
+        }
+        
+        var isOk = (rSit === "Conferido");
+        if(!isOk) recsMap[idKey].complete = false;
+        
+        recsMap[idKey].clients.push({
+          name: rCliente,
+          fantasia: "",
+          nfs: rNfs,
+          items: [{
+            name: rProds + " produto(s) registrados",
+            unit: "",
+            ordered: rProds,
+            loaded: rComp,
+            falta: rFalta,
+            nfotos: 0
+          }]
+        });
+      }
+      
+      var resList = [];
+      for(var k in recsMap) resList.push(recsMap[k]);
+      
+      report.recs = resList;
+      report.names = report.recs.map(function(r){return r.conf;}).filter(function(n,i,a){return n&&a.indexOf(n)===i;}).sort();
+      report.loading = false;
+      if(S.step==="report") renderReport();
+      return;
+    }
+
+    // Fallback: lê IndexedDB local se estiver sem conexão com a planilha
+    dbAll().then(function(all){
+      if(tk!==reportToken)return;
+      report.recs=(all||[]).filter(function(r){return r.kind!=="guia"&&r.date>=from&&r.date<=to;}).sort(function(a,b){return a.ts-b.ts;}).map(function(r){
+        var cls=recClients(r).map(function(c){
+          return {name:c.name||"",fantasia:c.fantasia||"",nfs:c.nfs||"",items:c.items.map(function(i){
+            return {name:i.name,unit:i.unit||"",ordered:i.ordered,loaded:i.loaded,falta:i.falta,nfotos:(i.regs||[]).filter(function(x){return x.foto;}).length};
+          })};
+        });
+        var ok=cls.every(function(c){return c.items.every(function(i){return i.falta===0;});});
+        return {id:r.id,date:r.date,hora:r.hora,conf:r.conferente||"",order:r.order,complete:ok,clients:cls};
       });
-      var ok=cls.every(function(c){return c.items.every(function(i){return i.falta===0;});});
-      return {id:r.id,date:r.date,hora:r.hora,conf:r.conferente||"",order:r.order,complete:ok,clients:cls};
+      report.names=report.recs.map(function(r){return r.conf;}).filter(function(n,i,a){return n&&a.indexOf(n)===i;}).sort();
+    }).catch(function(){
+      if(tk===reportToken)report.err="Não foi possível ler os dados guardados.";
+    }).then(function(){
+      if(tk!==reportToken)return;
+      report.loading=false;
+      if(S.step==="report")renderReport();
     });
-    report.names=report.recs.map(function(r){return r.conf;}).filter(function(n,i,a){return n&&a.indexOf(n)===i;}).sort();
-  }).catch(function(){
-    if(tk===reportToken)report.err="Não foi possível ler os dados guardados neste navegador.";
-  }).then(function(){
-    if(tk!==reportToken)return;
-    report.loading=false;
-    if(S.step==="report")renderReport();
   });
 }
+
 function shown(){return report.recs.filter(function(r){return !S.repConf||r.conf===S.repConf;});}
 function nPhotos(r){return r.clients.reduce(function(a,c){return a+c.items.reduce(function(b,i){return b+i.nfotos;},0);},0);}
 function loadCard(r){
@@ -340,7 +424,7 @@ function renderReport(){
     '<div class="field" style="margin-top:10px"><label for="repConf">Conferente</label><select class="inp" id="repConf"><option value="">Todos</option>'+
     report.names.map(function(n){return '<option value="'+esc(n)+'"'+(S.repConf===n?" selected":"")+'>'+esc(n)+'</option>';}).join("")+'</select></div>';
   var per=from===to?brDate(from):brDate(from)+" a "+brDate(to);
-  if(report.loading)html+='<div class="status" style="margin-top:12px">Carregando cargas...</div>';
+  if(report.loading)html+='<div class="status" style="margin-top:12px">Carregando cargas da planilha em nuvem...</div>';
   else if(report.err)html+='<div class="banner warn">'+esc(report.err)+'</div>';
   else if(!recs.length)html+='<div class="banner warn">Nenhuma carga salva em '+per+'.</div>';
   else html+='<div class="banner '+(nOk===recs.length?"ok":"warn")+'">'+recs.length+' carga(s) em '+per+': '+nOk+' completa(s)'+(recs.length-nOk?', '+(recs.length-nOk)+' com falta':'')+'.</div>';
