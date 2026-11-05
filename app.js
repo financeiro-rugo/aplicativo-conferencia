@@ -1,5 +1,13 @@
 (function(){
 "use strict";
+
+/* ==========================================================================
+   CONFIGURAÇÃO DA PLANILHA NO GOOGLE SHEETS
+   Cole abaixo a URL do seu App da Web entre as aspas:
+   ========================================================================== */
+var URL_GOOGLE_SCRIPT = "https://script.google.com/macros/s/AKfycby8thnuRK9J_ScgTCqo3g8QWRFfArN8Zdy-KPgrOvQCydR3A6P70kMikQhjNH3X3Xi3YA/exec";
+var SENHA_SERVIDOR = "1234"; // Senha configurada no seu Apps Script
+
 var KEY="conferencia-carga-v1";
 var app=document.getElementById("app");
 var overlays=document.getElementById("overlays");
@@ -45,7 +53,7 @@ function restore(){
   }catch(e){}
 }
 
-/* ---------- senha, dados e relatório (neste computador) ---------- */
+/* ---------- senha, dados e relatório ---------- */
 var SKEY="conferencia-senha-v1",SESS="conferencia-sessao-v1",NKEY="conferencia-conferentes-v1";
 var unlocked=false;
 var report={loading:false,recs:[],err:"",names:[]};
@@ -55,7 +63,7 @@ function todayStr(){var d=new Date();return d.getFullYear()+"-"+pad(d.getMonth()
 function nowHour(){var d=new Date();return pad(d.getHours())+":"+pad(d.getMinutes());}
 function brDate(s){return String(s).split("-").reverse().join("/");}
 
-/* SHA-256 em JavaScript puro (funciona também em endereços sem HTTPS) */
+/* SHA-256 */
 function sha256(ascii){
   function rr(v,a){return (v>>>a)|(v<<(32-a));}
   var mp=Math.pow,mw=mp(2,32),i,j,result="",words=[],bl=ascii.length*8;
@@ -219,15 +227,53 @@ function buildRecord(){
   var ok=clients.every(function(c){return c.items.every(function(i){return i.falta===0;});});
   return {id:S.orderId||uid(),conferente:(S.conferente||"").trim(),date:todayStr(),hora:nowHour(),ts:Date.now(),order:S.orderName||"Sem identificação",guiaId:S.guiaId||"",complete:ok,clients:clients};
 }
+
+/* ENVIO PARA O GOOGLE SHEETS (BANCO DE DADOS EM NUVEM) */
+function enviarParaGoogleSheets(rec) {
+  if (!URL_GOOGLE_SCRIPT) return;
+  recClients(rec).forEach(function(c) {
+    var comp = 0, fal = 0;
+    c.items.forEach(function(i) {
+      if (i.falta === 0) comp++; else fal++;
+    });
+    
+    var payload = {
+      acao: "salvar",
+      senha: SENHA_SERVIDOR,
+      ordem: rec.order,
+      cliente: c.name,
+      notasFiscais: c.nfs,
+      situacao: rec.complete ? "Conferido" : "Conferido com falta",
+      produtos: c.items.length,
+      produtosCompletos: comp,
+      produtosComFalta: fal,
+      conferente: rec.conferente,
+      data: brDate(rec.date),
+      hora: rec.hora
+    };
+
+    fetch(URL_GOOGLE_SCRIPT, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify(payload)
+    }).then(function(res){ return res.json(); })
+      .then(function(data){ console.log("Registrado no Sheets:", data); })
+      .catch(function(err){ console.error("Erro ao enviar para Google Sheets:", err); });
+  });
+}
+
 function finalize(){
   var rec=buildRecord(),jobs=[];
   recClients(rec).forEach(function(c){c.items.forEach(function(it){it.regs.forEach(function(r){
     if(typeof r.foto==="string"&&r.foto)jobs.push(fetch(r.foto).then(function(x){return x.blob();}).then(function(b){r.foto=b;}));
   });});});
-  Promise.all(jobs).then(function(){return dbPut(rec);}).then(function(){
+  Promise.all(jobs).then(function(){
+    enviarParaGoogleSheets(rec); // Envia para o banco de dados em nuvem
+    return dbPut(rec);
+  }).then(function(){
     S={step:"setup",orderId:"",orderName:S.orderName,conferente:S.conferente,repConf:"",draft:S.draft,guiaId:S.guiaId,items:[],clients:[],openClient:null,editC:-1,busca:"",fil:"",openId:null,zoom:null,confirmReset:false,confirmFinal:false,reportDate:todayStr(),reportTo:todayStr()};
     save();render();window.scrollTo(0,0);loadInfo();
-    toast("Conferência salva. O cliente aparece no relatório.");
+    toast("Conferência salva e sincronizada na planilha!");
   }).catch(function(){
     S.confirmFinal=false;render();
     toast("Não foi possível salvar a carga. Nada foi apagado. Tente de novo.");
@@ -470,7 +516,7 @@ function toast(msg){
   clearTimeout(toastTimer);toastTimer=setTimeout(function(){t.hidden=true;},2800);
 }
 
-/* ---------- leitura do PDF (guia de entrega, separada por cliente) ---------- */
+/* ---------- leitura do PDF ---------- */
 function agruparLinhas(items){
   var its=items.slice().sort(function(a,b){return b.y-a.y||a.x-b.x;}),lines=[],cur=null;
   its.forEach(function(it){
@@ -493,7 +539,6 @@ function nfsTexto(nfs){
 function nfsLimpa(str){
   return String(str||"").replace(/\d[\d.]*\d/g,function(m){return m.replace(/\./g,"");});
 }
-/* pages: lista de páginas; cada página é uma lista de {x,y,s} (texto, posição) */
 function parseGuia(pages){
   var out={ordem:"",clientes:[]},cur=null;
   pages.forEach(function(items){
