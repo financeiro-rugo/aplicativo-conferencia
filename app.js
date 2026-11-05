@@ -5,7 +5,22 @@
    CONFIGURAÇÃO DA PLANILHA NO GOOGLE SHEETS
    ========================================================================== */
 var URL_GOOGLE_SCRIPT = "https://script.google.com/macros/s/AKfycby8thnuRK9J_ScgTCqo3g8QWRFfArN8Zdy-KPgrOvQCydR3A6P70kMikQhjNH3X3Xi3YA/exec";
-var SENHA_SERVIDOR = "1234";
+var SENHA_SERVIDOR = "1234"; // temporário; altere no app e no Apps Script
+var SYNC_INTERVAL_MS = 5000;
+var SYNC_STATE_ID = "estado-conferencia-compartilhado";
+var syncApplying = false;
+var syncStarted = false;
+var syncLastLocal = 0;
+var syncLastRemote = 0;
+var syncTimer = null;
+var syncSaveTimer = null;
+var syncDeviceId = (function(){
+  try {
+    var k="conferencia-device-id-v1", v=localStorage.getItem(k);
+    if(!v){v=uid();localStorage.setItem(k,v);}
+    return v;
+  } catch(e){return uid();}
+})();
 
 var KEY="conferencia-carga-v1";
 var app=document.getElementById("app");
@@ -34,12 +49,119 @@ function parseNum(s){
   return parseFloat(s);
 }
 
+
+/* ---------- sincronização central (Google Apps Script) ---------- */
+function syncJsonp(params){
+  return new Promise(function(resolve,reject){
+    if(!URL_GOOGLE_SCRIPT){reject(new Error("URL do Apps Script não configurada"));return;}
+    var cb="__ccSync_"+uid()+"_"+Date.now();
+    var script=document.createElement("script");
+    var timer=setTimeout(function(){cleanup();reject(new Error("Tempo esgotado ao consultar servidor"));},15000);
+    function cleanup(){clearTimeout(timer);try{delete window[cb];}catch(e){window[cb]=undefined;}if(script.parentNode)script.parentNode.removeChild(script);}
+    window[cb]=function(data){cleanup();resolve(data);};
+    params=params||{};params.callback=cb;
+    var q=Object.keys(params).map(function(k){return encodeURIComponent(k)+"="+encodeURIComponent(params[k]);}).join("&");
+    script.onerror=function(){cleanup();reject(new Error("Falha ao consultar Google Apps Script"));};
+    script.src=URL_GOOGLE_SCRIPT+"?"+q;
+    document.head.appendChild(script);
+  });
+}
+function syncPost(payload){
+  if(!URL_GOOGLE_SCRIPT)return Promise.resolve();
+  payload.senha=SENHA_SERVIDOR;
+  return fetch(URL_GOOGLE_SCRIPT,{
+    method:"POST",mode:"no-cors",
+    headers:{"Content-Type":"text/plain;charset=utf-8"},
+    body:JSON.stringify(payload)
+  }).catch(function(err){console.warn("Sincronização: falha de envio",err);});
+}
+function syncStatePayload(){
+  // Sheets sincroniza quantidades e dados; fotos/blob ficam locais neste MVP.
+  var state={
+    step:S.step,orderId:S.orderId,orderName:S.orderName,conferente:S.conferente,
+    draft:S.draft,items:S.items,clients:S.clients,guiaId:S.guiaId||"",
+    openClient:S.openClient||null,updatedAt:Date.now(),deviceId:syncDeviceId
+  };
+  return JSON.parse(JSON.stringify(state,function(k,v){
+    if(k==="photo"||k==="foto"||k==="fotoData"||k==="blob")return undefined;
+    if(typeof Blob!=="undefined"&&v instanceof Blob)return undefined;
+    return v;
+  }));
+}
+function syncQueueState(){
+  if(syncApplying||!URL_GOOGLE_SCRIPT)return;
+  syncLastLocal=Date.now();
+  clearTimeout(syncSaveTimer);
+  syncSaveTimer=setTimeout(function(){
+    syncPost({acao:"syncState",id:SYNC_STATE_ID,updatedAt:syncLastLocal,state:syncStatePayload()});
+  },700);
+}
+function syncPushRecord(rec){
+  if(syncApplying||!rec||!rec.id)return;
+  // photos/blobs remain local; records and quantities are synced centrally.
+  var clean;
+  try{clean=JSON.parse(JSON.stringify(rec,function(k,v){
+    if(k==="foto"||k==="photo"||k==="fotoData"||k==="blob")return undefined;
+    if(typeof Blob!=="undefined"&&v instanceof Blob)return undefined;
+    return v;
+  }));}catch(e){return;}
+  syncPost({acao:"syncRecord",id:String(clean.id),record:clean,updatedAt:Date.now()});
+}
+function syncApplyState(state,updatedAt){
+  if(!state||!updatedAt||updatedAt<=syncLastRemote)return;
+  if(Date.now()-syncLastLocal<4000)return; // evita substituir edição local recente
+  syncLastRemote=updatedAt;
+  syncApplying=true;
+  try{
+    S.step=state.step||"setup";S.orderId=state.orderId||"";S.orderName=state.orderName||"";
+    S.conferente=state.conferente||"";S.draft=state.draft||[];S.items=state.items||[];
+    S.clients=state.clients||[];S.guiaId=state.guiaId||"";S.openClient=state.openClient||null;
+    localStorage.setItem(KEY,JSON.stringify(state));
+    render();
+  }catch(e){console.warn("Não foi possível aplicar estado remoto",e);}
+  finally{syncApplying=false;}
+}
+function syncPull(){
+  if(!URL_GOOGLE_SCRIPT||syncApplying)return;
+  syncJsonp({acao:"syncList",senha:SENHA_SERVIDOR}).then(function(data){
+    if(!data||data.status!=="sucesso")return;
+    syncApplying=true;
+    var records=data.records||[];
+    var chain=Promise.resolve();
+    records.forEach(function(item){
+      if(item&&item.record&&item.record.id){
+        chain=chain.then(function(){
+          return dbGet(item.record.id).then(function(local){
+            if(!local||Number(item.updatedAt||0)>Number(local._syncUpdatedAt||0)){
+              item.record._syncUpdatedAt=Number(item.updatedAt||Date.now());
+              return dbPutLocal(item.record);
+            }
+          });
+        });
+      }
+    });
+    chain.then(function(){
+      syncApplying=false;
+      if(data.state)syncApplyState(data.state.state,data.state.updatedAt);
+      loadInfo();
+    }).catch(function(){syncApplying=false;});
+  }).catch(function(err){console.warn("Sincronização: consulta falhou",err);});
+}
+function dbPutLocal(rec){return idbDo("readwrite",function(st){return st.put(rec);});}
+function startSync(){
+  if(syncStarted||!URL_GOOGLE_SCRIPT)return;
+  syncStarted=true;
+  syncPull();
+  syncTimer=setInterval(syncPull,SYNC_INTERVAL_MS);
+}
+
 function save(){
   try{
     localStorage.setItem(KEY,JSON.stringify({step:(S.step==="report"||S.step==="ajustes")?(S.items.length?"check":"setup"):S.step,orderId:S.orderId,orderName:S.orderName,conferente:S.conferente,draft:S.draft,items:S.items,clients:S.clients,guiaId:S.guiaId||"",openClient:S.openClient||null}));
   }catch(e){
     if(!warnedStorage){warnedStorage=true;toast("Memória do navegador cheia. Finalize e salve a carga atual.");}
   }
+  syncQueueState();
 }
 function restore(){
   try{
@@ -130,7 +252,11 @@ function idbDo(mode,fn){
     });
   });
 }
-function dbPut(rec){return idbDo("readwrite",function(s){return s.put(rec);});}
+function dbPut(rec){
+  return idbDo("readwrite",function(s){return s.put(rec);}).then(function(){
+    syncPushRecord(rec); return rec;
+  });
+}
 function dbAll(){return idbDo("readonly",function(s){return s.getAll();});}
 function dbGet(id){return idbDo("readonly",function(s){return s.get(id);});}
 
@@ -150,6 +276,7 @@ function loadInfo(){
     else if(S.step==="report")renderReport();
   });
 }
+
 function stOf(gid,key){
   var x=info.last[gid+"|"+key];
   if(!x)return {k:"nao",label:"Falta conferir",cls:"none"};
@@ -205,6 +332,7 @@ function sair(){unlocked=false;try{sessionStorage.removeItem(SESS);}catch(e){}S.
 function startup(){
   try{unlocked=!!getSenha()&&sessionStorage.getItem(SESS)==="1";}catch(e){unlocked=false;}
   render();
+  startSync();
 }
 
 /* conferentes */
@@ -227,7 +355,7 @@ function buildRecord(){
   return {id:S.orderId||uid(),conferente:(S.conferente||"").trim(),date:todayStr(),hora:nowHour(),ts:Date.now(),order:S.orderName||"Sem identificação",guiaId:S.guiaId||"",complete:ok,clients:clients};
 }
 
-/* ENVIO PARA O GOOGLE SHEETS (BANCO DE DADOS EM NUVEM) */
+/* Envio de resumo legado; sincronização central ocorre em syncPushRecord/syncQueueState. */
 function enviarParaGoogleSheets(rec) {
   if (!URL_GOOGLE_SCRIPT) return;
   recClients(rec).forEach(function(c) {
@@ -440,7 +568,7 @@ function downloadSheet(){
     var wb=XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb,w1,"Conferências");
     XLSX.utils.book_append_sheet(wb,w2,"Total por produto");
-    try{XLSX.writeFile(wb,base+".xlsx");toast("Planilha .xlsx gerada.");return;}catch(e){}
+try{XLSX.writeFile(wb,base+".xlsx");toast("Planilha .xlsx gerada.");return;}catch(e){}
   }
   saveBlob(new Blob([csvOf(linhas)],{type:"text/csv;charset=utf-8"}),base+".csv");
   toast("Planilha .csv gerada. Abre no Excel.");
