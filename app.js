@@ -34,6 +34,17 @@ var WORKER_URL = "https://rugo-conferencia-api.financeirorugo.workers.dev";
 var API_TOKEN = "";
 var SYNC_INTERVAL_MS = 6000;
 var syncStarted = false, syncBusy = false;
+var guiaSaveTimer = null;
+/* Sincroniza automaticamente alterações feitas na guia após uma pausa na digitação. */
+function scheduleSaveGuia(){
+  if(guiaSaveTimer)clearTimeout(guiaSaveTimer);
+  guiaSaveTimer=setTimeout(function(){
+    guiaSaveTimer=null;
+    if(unlocked && S.step==="setup" && S.guiaId && S.draft.length){
+      saveGuia().catch(function(err){console.warn("Falha ao sincronizar guia editada",err);});
+    }
+  },900);
+}
 function apiHeaders(){
   var h={"Content-Type":"application/json"};
   if(API_TOKEN)h.Authorization="Bearer "+API_TOKEN;
@@ -972,10 +983,10 @@ document.addEventListener("click",function(ev){
       if(!inp||inp.value.trim().toUpperCase()!=="EXCLUIR"){toast("Digite EXCLUIR para confirmar.");return;}
       excluirCargas(null).then(function(n){S.confirmDelAll=false;return loadInfo();}).then(function(){render();toast("Todas as cargas foram excluídas.");}).catch(function(){toast("Não foi possível excluir.");});break;
     case "pick-pdf":pdfIn.value="";pdfIn.click();break;
-    case "dc-add":S.draft.push({key:uid(),code:"",name:"",fantasia:"",address:"",obs:"",nfs:"",expected:0,items:[{name:"",qty:"",unit:""}]});S.editC=S.draft.length-1;if(!S.guiaId)S.guiaId=uid();renderDraft();save();break;
+    case "dc-add":S.draft.push({key:uid(),code:"",name:"",fantasia:"",address:"",obs:"",nfs:"",expected:0,items:[{name:"",qty:"",unit:""}]});S.editC=S.draft.length-1;if(!S.guiaId)S.guiaId=uid();renderDraft();save();scheduleSaveGuia();break;
     case "dc-toggle":var tc=+el.getAttribute("data-c");var wasOpen=S.editC===tc;S.editC=wasOpen?-1:tc;renderDraft();if(wasOpen)saveGuia();break;
-    case "dc-add-item":S.draft[+el.getAttribute("data-c")].items.push({name:"",qty:"",unit:""});renderDraft();save();break;
-    case "dc-del-item":S.draft[+el.getAttribute("data-c")].items.splice(+el.getAttribute("data-i"),1);renderDraft();save();break;
+    case "dc-add-item":S.draft[+el.getAttribute("data-c")].items.push({name:"",qty:"",unit:""});renderDraft();save();scheduleSaveGuia();break;
+    case "dc-del-item":S.draft[+el.getAttribute("data-c")].items.splice(+el.getAttribute("data-i"),1);renderDraft();save();scheduleSaveGuia();break;
     case "dc-del":S.draft.splice(+el.getAttribute("data-c"),1);S.editC=-1;renderDraft();saveGuia();break;
     case "conf-client":
       var cc=S.draft[+el.getAttribute("data-c")];if(!cc)return;
@@ -1071,6 +1082,7 @@ document.addEventListener("input",function(ev){
       if(t.hasAttribute("data-i")){var d=c.items[+t.getAttribute("data-i")];if(d)d[f]=t.value;}
       else c[f]=t.value;
       save();
+      if(S.step==="setup")scheduleSaveGuia();
     }
   }
 });
