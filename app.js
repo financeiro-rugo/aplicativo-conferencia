@@ -400,7 +400,7 @@ function loadCard(r){
       var faltas=c.items.filter(function(i){return i.falta>0;}).length;
       return '<div class="hint" style="margin-top:12px"><b>'+esc(c.name||"Sem cliente")+'</b>'+(c.nfs?' · <span class="mono">NF '+esc(c.nfs)+'</span>':'')+' · '+(faltas?faltas+' com falta':'completo')+'</div>'+
         c.items.map(function(i){
-          return '<div class="mini"><span class="n">'+esc(i.name)+'</span><span class="v mono">'+fmt(i.loaded)+' / '+fmt(i.ordered)+' '+esc(i.unit)+
+          return '<div class="mini"><span class="n">'+(i.code?'<b class="mono">'+esc(String(i.code).replace(/\./g,""))+'</b> — ':'')+esc(i.name)+'</span><span class="v mono">'+fmt(i.loaded)+' / '+fmt(i.ordered)+' '+esc(i.unit)+
             (i.falta>0?'<br><span class="pill warn">falta '+fmt(i.falta)+'</span>':'')+'</span></div>';
         }).join("");
     }).join("")+
@@ -452,8 +452,8 @@ function renderSituacao(tabs){
     vis.map(function(c){
       var st=stOf(g.id,c.key),x=st.x,np=0;
       var lines=x?x.c.items.map(function(i){np+=(i.regs||[]).filter(function(r){return r.foto;}).length;
-          return '<div class="mini"><span class="n">'+esc(i.name)+'</span><span class="v mono">'+fmt(i.loaded)+' / '+fmt(i.ordered)+' '+esc(i.unit)+(i.falta>0?'<br><span class="pill warn">falta '+fmt(i.falta)+'</span>':'')+'</span></div>';}).join("")
-        :c.items.map(function(i){return '<div class="mini"><span class="n">'+esc(i.name)+'</span><span class="v mono">'+fmt(i.ordered)+' '+esc(i.unit)+'<br><span class="pill none">falta conferir</span></span></div>';}).join("");
+          return '<div class="mini"><span class="n">'+(i.code?'<b class="mono">'+esc(String(i.code).replace(/\./g,""))+'</b> — ':'')+esc(i.name)+'</span><span class="v mono">'+fmt(i.loaded)+' / '+fmt(i.ordered)+' '+esc(i.unit)+(i.falta>0?'<br><span class="pill warn">falta '+fmt(i.falta)+'</span>':'')+'</span></div>';}).join("")
+        :c.items.map(function(i){return '<div class="mini"><span class="n">'+(i.code?'<b class="mono">'+esc(String(i.code).replace(/\./g,""))+'</b> — ':'')+esc(i.name)+'</span><span class="v mono">'+fmt(i.ordered)+' '+esc(i.unit)+'<br><span class="pill none">falta conferir</span></span></div>';}).join("");
       return '<details class="load"><summary><b>'+esc(c.name)+'</b> <span class="pill '+st.cls+'">'+esc(st.label)+'</span><div class="hint mono">NF '+esc(c.nfs||"-")+'</div>'+
         (x?'<div class="hint">Conferido por '+esc(x.rec.conferente||"não informado")+' em '+esc(brDate(x.rec.date))+' '+esc(x.rec.hora)+'</div>':'')+'</summary>'+lines+
         (np?'<div style="margin-top:10px"><button class="btn small ghost" data-act="photos" data-id="'+esc(x.rec.id)+'" type="button">Ver fotos ('+np+')</button></div>':'')+'</details>';
@@ -649,7 +649,7 @@ function parseGuia(pages){
       var res=[];
       agruparLinhas(items.filter(function(i){return i.y<topY-1&&i.y>lower+1;})).forEach(function(l){
         var m=/^(\d[\d.]*)\s+(.+?)\s+(\d+(?:,\d+)?)$/.exec(l.text);
-        if(m)res.push({code:m[1],name:m[2],qty:m[3]});
+        if(m)res.push({code:m[1].replace(/\./g,""),name:m[2],qty:m[3]});
       });
       return res;
     }
@@ -882,7 +882,7 @@ function clientListHtml(){
 function productCard(it){
   var st=statusOf(it),pct=Math.min(100,Math.round(loaded(it)/it.ordered*100));
   return '<button class="card '+st.card+'" data-act="open" data-id="'+it.id+'" type="button">'+
-    '<div class="name">'+esc(it.name)+'</div>'+
+    '<div class="name">'+(it.code?'<span class="mono">'+esc(String(it.code).replace(/\./g,""))+'</span> — ':'')+esc(it.name)+'</div>'+
     '<div class="nums"><div class="big">'+fmt(loaded(it))+' <small>/ '+fmt(it.ordered)+' '+esc(it.unit)+'</small></div><span class="pill '+st.cls+'">'+st.label+'</span></div>'+
     '<div class="bar"><i style="width:'+pct+'%"></i></div></button>';
 }
@@ -941,7 +941,7 @@ function renderSummary(){
       return '<h2 class="sec-title" style="font-size:19px;margin-top:18px">'+esc(c.name)+'</h2><div class="hint mono">NF '+esc(c.nfs||"-")+'</div>'+
         itensDe(c.id).map(function(it){
           var st=statusOf(it);
-          return '<div class="sum-row"><div class="n">'+esc(it.name)+'<div class="hint mono">'+fmt(loaded(it))+' de '+fmt(it.ordered)+' '+esc(it.unit)+'</div></div><div class="v"><span class="pill '+st.cls+'">'+st.label+'</span></div></div>';
+          return '<div class="sum-row"><div class="n">'+(it.code?'<span class="mono">'+esc(String(it.code).replace(/\./g,""))+'</span> — ':'')+esc(it.name)+'<div class="hint mono">'+fmt(loaded(it))+' de '+fmt(it.ordered)+' '+esc(it.unit)+'</div></div><div class="v"><span class="pill '+st.cls+'">'+st.label+'</span></div></div>';
         }).join("");
     }).join("")+
     '<div class="actions"><button class="btn" data-act="back" type="button">Voltar</button><button class="btn primary" data-act="copy" type="button">Copiar resumo</button></div>';
@@ -955,7 +955,7 @@ function renderOverlays(){
   if(it){
     var f=falta(it);
     html+='<div class="overlay" data-act="close-bg"><div class="sheet" role="dialog" aria-label="Registrar carga" id="sheetBox">'+
-      '<div class="sheet-head"><h2>'+esc(it.name)+'</h2><button class="close" data-act="close" aria-label="Fechar" type="button">&times;</button></div>'+
+      '<div class="sheet-head"><h2>'+(it.code?esc(String(it.code).replace(/\./g,""))+' — ':'')+esc(it.name)+'</h2><button class="close" data-act="close" aria-label="Fechar" type="button">&times;</button></div>'+
       '<div class="hint">'+esc(clientOf(it).name)+(clientOf(it).nfs?' · NF '+esc(clientOf(it).nfs):'')+'</div>'+
       '<div class="tri"><div><span>Ordem</span><b>'+fmt(it.ordered)+'</b></div><div><span>Carregado</span><b>'+fmt(loaded(it))+'</b></div><div class="falta'+(f===0?" zero":"")+'"><span>Falta</span><b>'+fmt(f)+'</b></div></div>';
     if(f===0){
