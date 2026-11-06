@@ -33,6 +33,12 @@ function parseNum(s){
 var URL_GOOGLE_SCRIPT = "https://script.google.com/macros/s/AKfycby8thnuRK9J_ScgTCqo3g8QWRFfArN8Zdy-KPgrOvQCydR3A6P70kMikQhjNH3X3Xi3YA/exec";
 var SENHA_SERVIDOR = "1234"; // temporária; troque aqui e no Apps Script
 var SYNC_INTERVAL_MS = 6000;
+/* SENHAS DE ACESSO (guardadas só como "hash"; para trocar use Ajustes > Senhas, com a senha de administrador)
+   Senhas padrão: administrador = admin1234 | equipe = equipe1234. Troque antes de usar. */
+var SALT_SENHA = "cc-conferencia-v1";
+var HASH_ADMIN = "086d7fdca25dd4ff133d76a6cedead693ddd7282be5bf11b427cca5aab045b88";
+var HASH_EQUIPE = "e09d8aee11912d19ecefca5174f48879ec7e4b8a0674e94429703d1056c77ed8";
+var EQUIPE_PODE_FINALIZAR = false; // true = a equipe também pode finalizar/reabrir cargas
 var syncStarted = false, syncBusy = false;
 function syncJsonp(params){
   return new Promise(function(resolve,reject){
@@ -147,7 +153,9 @@ function restore(){
 
 /* ---------- senha, dados e relatório (neste computador) ---------- */
 var SKEY="conferencia-senha-v1",SESS="conferencia-sessao-v1",NKEY="conferencia-conferentes-v1";
-var unlocked=false;
+var unlocked=false,role="";
+function isAdmin(){return role==="admin";}
+function podeFinalizar(){return role==="admin"||EQUIPE_PODE_FINALIZAR;}
 var report={loading:false,recs:[],err:"",names:[]};
 var reportToken=0;
 function pad(n){return n<10?"0"+n:""+n;}
@@ -195,12 +203,12 @@ function hashSenha(pass,salt){
   for(var i=0;i<2000;i++)h=sha256(h+salt);
   return h;
 }
-function getSenha(){try{return JSON.parse(localStorage.getItem(SKEY)||"null");}catch(e){return null;}}
-function setSenha(pass){
-  var salt=uid()+uid()+uid();
-  try{localStorage.setItem(SKEY,JSON.stringify({salt:salt,hash:hashSenha(pass,salt)}));return true;}catch(e){return false;}
+function roleDe(pass){
+  var h=hashSenha(pass,SALT_SENHA);
+  if(h===HASH_ADMIN)return "admin";
+  if(h===HASH_EQUIPE)return "equipe";
+  return "";
 }
-function checkSenha(pass){var r=getSenha();return !!r&&hashSenha(pass,r.salt)===r.hash;}
 
 /* banco de dados do navegador (IndexedDB) */
 var idbP=null;
@@ -231,20 +239,28 @@ function dbAll(){return idbDo("readonly",function(s){return s.getAll();});}
 function dbGet(id){return idbDo("readonly",function(s){return s.get(id);});}
 
 /* guias salvas e situação de cada cliente */
-var info={guias:[],last:{}};
+var info={guias:[],last:{},gone:{}};
 function ensureKeys(){S.draft.forEach(function(c){if(!c.key)c.key=uid();});}
 function loadInfo(quiet){
   return dbAll().then(function(all){
     all=all||[];
-    info.guias=all.filter(function(r){return r.kind==="guia";}).sort(function(a,b){return b.ts-a.ts;});
+    info.gone={};all.forEach(function(r){if(r.deleted&&r.kind==="guia")info.gone[r.id]=1;});
+    info.guias=all.filter(function(r){return r.kind==="guia"&&!r.deleted;}).sort(function(a,b){return b.ts-a.ts;});
     info.last={};
-    all.filter(function(r){return r.kind!=="guia"&&r.guiaId;}).sort(function(a,b){return a.ts-b.ts;}).forEach(function(r){
+    all.filter(function(r){return !r.deleted&&r.kind!=="guia"&&r.guiaId;}).sort(function(a,b){return a.ts-b.ts;}).forEach(function(r){
       recClients(r).forEach(function(c){if(c.key)info.last[r.guiaId+"|"+c.key]={c:c,rec:r};});
     });
   }).catch(function(){}).then(function(){
+    if(S.guiaId&&info.gone[S.guiaId]&&S.step==="setup"){S.draft=[];S.guiaId="";S.guiaFin={};S.orderName="";S.editC=-1;S.confirmDel=false;save();render();toast("Esta carga foi excluída.");return;}
     if(quiet&&syncHasActiveEditor())return;
     if(S.step==="setup"){if(S.guiaId)renderDraft();else renderHome();}
     else if(S.step==="report"&&!quiet)renderReport();
+  });
+}
+function excluirCargas(guiaId){
+  return dbAll().then(function(all){
+    var alvo=(all||[]).filter(function(r){return !r.deleted&&(!guiaId||(r.kind==="guia"?r.id===guiaId:r.guiaId===guiaId));});
+    return alvo.reduce(function(pr,r){return pr.then(function(){return dbPut({id:r.id,kind:r.kind||"",deleted:true,ts:Date.now(),date:r.date||todayStr()});});},Promise.resolve()).then(function(){return alvo.length;});
   });
 }
 function stOf(gid,key){
@@ -275,33 +291,24 @@ function abrirGuia(id){
 
 /* entrada */
 function renderGate(msg){
-  var first=!getSenha();
   app.innerHTML=
     '<div class="intro"><div class="eyebrow">Doca de carregamento</div><h1 class="title">Conferência de Carga</h1>'+
-    '<p>'+(first?'Primeiro acesso. Crie a senha de acesso do aplicativo.':'Digite a senha para entrar.')+'</p></div>'+
+    '<p>Digite a senha para entrar.</p></div>'+
     '<div class="stack" style="margin-top:16px">'+
-    '<div class="field"><label for="gPass">'+(first?'Nova senha':'Senha')+'</label><input class="inp" id="gPass" type="password" autocomplete="'+(first?'new-password':'current-password')+'"></div>'+
-    (first?'<div class="field"><label for="gPass2">Repita a senha</label><input class="inp" id="gPass2" type="password" autocomplete="new-password"></div>':'')+
+    '<div class="field"><label for="gPass">Senha</label><input class="inp" id="gPass" type="password" autocomplete="current-password"></div>'+
     '<div class="status'+(msg?" err":"")+'" id="gStatus" role="status">'+esc(msg||"")+'</div>'+
-    '<button class="btn primary" id="gBtn" data-act="'+(first?'gate-create':'gate-enter')+'" type="button">'+(first?'Criar senha e entrar':'Entrar')+'</button></div>';
+    '<button class="btn primary" id="gBtn" data-act="gate-enter" type="button">Entrar</button></div>';
 }
-function unlock(){unlocked=true;try{sessionStorage.setItem(SESS,"1");}catch(e){}render();}
+function unlock(r){role=r;unlocked=true;try{sessionStorage.setItem(SESS,r);}catch(e){}S.step=S.items.length?"check":"setup";render();}
 function gateEnter(){
   var p=document.getElementById("gPass").value||"",st=document.getElementById("gStatus");
   if(!p){st.textContent="Digite a senha.";st.className="status err";return;}
-  if(checkSenha(p))unlock();else{st.textContent="Senha incorreta.";st.className="status err";}
+  st.textContent="Conferindo...";st.className="status";
+  setTimeout(function(){var r=roleDe(p);if(r)unlock(r);else{st.textContent="Senha incorreta.";st.className="status err";}},20);
 }
-function gateCreate(){
-  var p=document.getElementById("gPass").value||"",p2=document.getElementById("gPass2").value||"",st=document.getElementById("gStatus");
-  function say(t){st.textContent=t;st.className="status err";}
-  if(p.length<4){say("Use pelo menos 4 caracteres.");return;}
-  if(p!==p2){say("As duas senhas não são iguais.");return;}
-  if(!setSenha(p)){say("Não foi possível guardar a senha neste navegador.");return;}
-  unlock();
-}
-function sair(){unlocked=false;try{sessionStorage.removeItem(SESS);}catch(e){}S.step=S.items.length?"check":"setup";render();}
+function sair(){unlocked=false;role="";try{sessionStorage.removeItem(SESS);}catch(e){}S.step=S.items.length?"check":"setup";render();}
 function startup(){
-  try{unlocked=!!getSenha()&&sessionStorage.getItem(SESS)==="1";}catch(e){unlocked=false;}
+  try{var r0=sessionStorage.getItem(SESS);if(r0==="admin"||r0==="equipe"){role=r0;unlocked=true;}else unlocked=false;}catch(e){unlocked=false;}
   render();startSync();
 }
 
@@ -352,7 +359,7 @@ function loadReport(quiet){
   if(!quiet){report={loading:true,recs:[],err:"",names:[]};render();}
   dbAll().then(function(all){
     if(tk!==reportToken)return;
-    report.recs=(all||[]).filter(function(r){return r.kind!=="guia"&&r.date>=from&&r.date<=to;}).sort(function(a,b){return a.ts-b.ts;}).map(function(r){
+    report.recs=(all||[]).filter(function(r){return !r.deleted&&r.kind!=="guia"&&r.date>=from&&r.date<=to;}).sort(function(a,b){return a.ts-b.ts;}).map(function(r){
       var cls=recClients(r).map(function(c){
         return {name:c.name||"",fantasia:c.fantasia||"",nfs:c.nfs||"",items:c.items.map(function(i){
           return {name:i.name,unit:i.unit||"",ordered:i.ordered,loaded:i.loaded,falta:i.falta,nfotos:(i.regs||[]).filter(function(x){return x.foto;}).length};
@@ -390,7 +397,7 @@ function loadCard(r){
 function renderReport(){
   var from=S.reportDate||todayStr(),to=S.reportTo||from,recs=shown();
   var nOk=recs.filter(function(r){return r.complete;}).length;
-  var tabs='<div class="actions" style="margin-top:14px"><button class="btn'+(S.repTab==="sit"?"":" primary")+'" data-act="rtab" data-t="feitas" type="button">Conferências feitas</button><button class="btn'+(S.repTab==="sit"?" primary":"")+'" data-act="rtab" data-t="sit" type="button">Situação por cliente</button></div>';
+  var tabs='<div class="actions" style="margin-top:14px"><button class="btn'+(S.repTab==="sit"?"":" primary")+'" data-act="rtab" data-t="feitas" type="button">Conferências feitas</button><button class="btn'+(S.repTab==="sit"?" primary":"")+'" data-act="rtab" data-t="sit" type="button">Carga completa</button></div>';
   if(S.repTab==="sit"){renderSituacao(tabs);return;}
   var html='<div class="top"><div class="eyebrow">Relatório</div><h1 class="title">Conferências feitas</h1></div>'+tabs+
     '<div class="actions" style="margin-top:14px"><div class="field"><label for="repDate">De</label><input class="inp" id="repDate" type="date" value="'+esc(from)+'"></div>'+
@@ -410,8 +417,17 @@ function renderReport(){
   app.innerHTML=html;
 }
 function guiaSel(){return info.guias.filter(function(x){return x.id===S.repGuia;})[0]||info.guias.filter(function(x){return x.id===S.guiaId;})[0]||info.guias[0];}
+function totaisCarga(g){
+  var m={},ord=[];
+  g.clients.forEach(function(c){
+    c.items.forEach(function(i){var k=(i.name+"|"+(i.unit||"")).toLowerCase();if(!m[k]){m[k]={n:i.name,u:i.unit||"",o:0,l:0};ord.push(k);}m[k].o=r3(m[k].o+i.ordered);});
+    var x=stOf(g.id,c.key).x;
+    if(x)x.c.items.forEach(function(i){var k=(i.name+"|"+(i.unit||"")).toLowerCase();if(m[k])m[k].l=r3(m[k].l+i.loaded);});
+  });
+  return ord.map(function(k){return m[k];});
+}
 function renderSituacao(tabs){
-  var g=guiaSel(),html='<div class="top"><div class="eyebrow">Relatório</div><h1 class="title">Situação por cliente</h1></div>'+tabs;
+  var g=guiaSel(),html='<div class="top"><div class="eyebrow">Relatório</div><h1 class="title">Carga completa</h1></div>'+tabs;
   if(!g){app.innerHTML=html+'<div class="banner warn">Nenhuma guia salva ainda. Anexe o PDF da guia na tela inicial.</div><div class="stack" style="margin-top:16px"><button class="btn" data-act="rback" type="button">Voltar</button></div>';return;}
   var nOk=0,nF=0,nN=0;
   g.clients.forEach(function(c){var k=stOf(g.id,c.key).k;if(k==="ok")nOk++;else if(k==="falta")nF++;else nN++;});
@@ -419,6 +435,8 @@ function renderSituacao(tabs){
   html+='<div class="field" style="margin-top:10px"><label for="repGuia">Guia</label><select class="inp" id="repGuia">'+info.guias.map(function(x){return '<option value="'+esc(x.id)+'"'+(x.id===g.id?" selected":"")+'>'+esc(x.order)+' - '+esc(brDate(x.date))+(x.fin?' (finalizada)':' (em aberto)')+'</option>';}).join("")+'</select></div>'+
     '<div class="field" style="margin-top:10px"><label for="repFil">Mostrar</label><select class="inp" id="repFil"><option value="">Todos os clientes</option><option value="nao"'+(S.repFil==="nao"?" selected":"")+'>Falta conferir</option><option value="falta"'+(S.repFil==="falta"?" selected":"")+'>Conferidos com falta</option><option value="ok"'+(S.repFil==="ok"?" selected":"")+'>Conferidos completos</option></select></div>'+
     '<div class="banner '+(nOk===g.clients.length?"ok":"warn")+'">'+g.clients.length+' clientes: '+nOk+' conferido(s) completo(s), '+nF+' com falta, '+nN+' falta conferir.</div>'+
+    '<details class="load"><summary><b>Total da carga por produto</b> <span class="hint">conferido x guia</span></summary>'+
+      totaisCarga(g).map(function(t){var f=r3(Math.max(0,t.o-t.l));return '<div class="mini"><span class="n">'+esc(t.n)+'</span><span class="v mono">'+fmt(t.l)+' / '+fmt(t.o)+' '+esc(t.u)+(f>0?'<br><span class="pill '+(t.l?"warn":"none")+'">falta '+fmt(f)+'</span>':'<br><span class="pill ok">completo</span>')+'</span></div>';}).join("")+'</details>'+
     vis.map(function(c){
       var st=stOf(g.id,c.key),x=st.x,np=0;
       var lines=x?x.c.items.map(function(i){np+=(i.regs||[]).filter(function(r){return r.foto;}).length;
@@ -452,6 +470,8 @@ function downloadSituacao(all){
     w1["!cols"]=[{wch:26},{wch:40},{wch:30},{wch:20},{wch:10},{wch:12},{wch:12},{wch:20},{wch:12},{wch:8}];
     w2["!cols"]=[{wch:26},{wch:40},{wch:30},{wch:20},{wch:42},{wch:9},{wch:12},{wch:14},{wch:9},{wch:16},{wch:20},{wch:12},{wch:8}];
     var wb=XLSX.utils.book_new();XLSX.utils.book_append_sheet(wb,w1,"Resumo por cliente");XLSX.utils.book_append_sheet(wb,w2,"Produtos");
+    if(!all){var tt=[["Produto","Unidade","Qtd. da guia","Qtd. conferida","Falta"]].concat(totaisCarga(gs[0]).map(function(t){return [t.n,t.u,t.o,t.l,r3(Math.max(0,t.o-t.l))];}));
+      var w3=XLSX.utils.aoa_to_sheet(tt);w3["!cols"]=[{wch:42},{wch:9},{wch:12},{wch:14},{wch:9}];XLSX.utils.book_append_sheet(wb,w3,"Total por produto");}
     try{XLSX.writeFile(wb,base+".xlsx");toast("Planilha .xlsx gerada.");return;}catch(e){}
   }
   saveBlob(new Blob([csvOf(linhas)],{type:"text/csv;charset=utf-8"}),base+".csv");
@@ -508,28 +528,32 @@ function downloadSheet(){
 /* ajustes: senha e backup */
 function renderSettings(){
   app.innerHTML='<div class="top"><div class="eyebrow">Aplicativo</div><h1 class="title">Ajustes</h1></div>'+
-    '<h2 class="sec-title">Trocar senha</h2><div class="stack">'+
-    '<div class="field"><label for="pOld">Senha atual</label><input class="inp" id="pOld" type="password" autocomplete="current-password"></div>'+
-    '<div class="field"><label for="pNew">Nova senha</label><input class="inp" id="pNew" type="password" autocomplete="new-password"></div>'+
-    '<div class="field"><label for="pNew2">Repita a nova senha</label><input class="inp" id="pNew2" type="password" autocomplete="new-password"></div>'+
+    '<h2 class="sec-title">Senhas de acesso</h2><div class="stack">'+
+    '<div class="hint">Administrador: anexa, edita e exclui cargas. Equipe: só confere. As senhas valem em todos os aparelhos porque ficam no arquivo app.js. Digite as novas, copie as 2 linhas geradas e cole no app.js do GitHub no lugar das linhas HASH_ADMIN e HASH_EQUIPE.</div>'+
+    '<div class="field"><label for="pAdm">Nova senha do administrador</label><input class="inp" id="pAdm" type="password" autocomplete="new-password"></div>'+
+    '<div class="field"><label for="pEq">Nova senha da equipe</label><input class="inp" id="pEq" type="password" autocomplete="new-password"></div>'+
     '<div class="status" id="pStatus" role="status"></div>'+
-    '<button class="btn" data-act="change-pass" type="button">Trocar senha</button></div>'+
+    '<button class="btn" data-act="gen-senhas" type="button">Gerar linhas para o app.js</button>'+
+    '<textarea class="inp mono" id="pOut" rows="4" readonly style="display:none"></textarea></div>'+
     '<h2 class="sec-title">Cópia de segurança</h2><div class="stack">'+
-    '<div class="hint">Os dados ficam guardados neste navegador, neste computador. Baixe uma cópia de vez em quando e guarde em outro lugar.</div>'+
+    '<div class="hint">Baixe uma cópia de vez em quando e guarde em outro lugar. As cargas também ficam na planilha do Google.</div>'+
     '<button class="btn" data-act="backup" type="button">Baixar cópia de segurança (.json)</button>'+
     '<button class="btn ghost" data-act="restore" type="button">Restaurar uma cópia</button></div>'+
     '<div class="stack" style="margin-top:22px"><button class="btn danger" data-act="sair" type="button">Sair do aplicativo</button>'+
     '<button class="btn" data-act="rback" type="button">Voltar</button></div>';
 }
-function changePass(){
-  var o=document.getElementById("pOld").value||"",n=document.getElementById("pNew").value||"",n2=document.getElementById("pNew2").value||"",st=document.getElementById("pStatus");
+function genSenhas(){
+  var a=document.getElementById("pAdm").value||"",e=document.getElementById("pEq").value||"",st=document.getElementById("pStatus"),out=document.getElementById("pOut");
   function say(t,ok){st.textContent=t;st.className="status"+(ok?"":" err");}
-  if(!checkSenha(o)){say("A senha atual está incorreta.");return;}
-  if(n.length<4){say("Use pelo menos 4 caracteres.");return;}
-  if(n!==n2){say("As duas senhas novas não são iguais.");return;}
-  if(!setSenha(n)){say("Não foi possível guardar a nova senha.");return;}
-  say("Senha trocada.",true);
-  ["pOld","pNew","pNew2"].forEach(function(id){document.getElementById(id).value="";});
+  if(a&&a.length<6||e&&e.length<6){say("Use pelo menos 6 caracteres.");return;}
+  if(!a&&!e){say("Digite pelo menos uma senha nova.");return;}
+  if(a&&e&&a===e){say("As duas senhas precisam ser diferentes.");return;}
+  say("Gerando...",true);
+  setTimeout(function(){
+    out.value='var HASH_ADMIN = "'+(a?hashSenha(a,SALT_SENHA):HASH_ADMIN)+'";\nvar HASH_EQUIPE = "'+(e?hashSenha(e,SALT_SENHA):HASH_EQUIPE)+'";';
+    out.style.display="block";out.select();
+    say("Copie as 2 linhas abaixo e cole no app.js (GitHub). Depois da publicação, as senhas novas valem em todos os aparelhos.",true);
+  },20);
 }
 function blobToDataUrl(b){return new Promise(function(res,rej){var f=new FileReader();f.onload=function(){res(f.result);};f.onerror=rej;f.readAsDataURL(b);});}
 function doBackup(){
@@ -718,7 +742,7 @@ function renderHome(){
   app.innerHTML=
     '<div class="intro"><div class="eyebrow">Doca de carregamento</div><h1 class="title">Conferência de Carga</h1>'+
     '<p>Anexe a guia de entrega em PDF de cada carga. Depois escolha a carga e o cliente que vai conferir.</p></div>'+
-    '<div class="stack" style="margin-top:16px"><button class="btn primary" data-act="pick-pdf" type="button">Anexar PDF de nova carga</button>'+pdfMsgHtml()+'</div>'+
+    (isAdmin()?'<div class="stack" style="margin-top:16px"><button class="btn primary" data-act="pick-pdf" type="button">Anexar PDF de nova carga</button>'+pdfMsgHtml()+'</div>':'')+
     '<div class="actions" style="margin-top:16px"><button class="btn'+(fin?"":" primary")+'" data-act="htab" data-t="abertas" type="button">Para conferir ('+ab.length+')</button><button class="btn'+(fin?" primary":"")+'" data-act="htab" data-t="fin" type="button">Finalizadas ('+fi.length+')</button></div>'+
     '<div class="stack" style="margin-top:12px">'+
     (lista.length?lista.map(function(g){
@@ -729,9 +753,15 @@ function renderHome(){
         '<div class="bar"><i style="width:'+(t.n?Math.round(t.ok/t.n*100):0)+'%"></i></div></button>';
     }).join(""):'<div class="status">'+(fin?"Nenhuma carga finalizada ainda.":"Nenhuma carga para conferir. Anexe o PDF de uma carga.")+'</div>')+
     '</div><div class="stack" style="margin-top:16px">'+
-    '<button class="btn ghost" data-act="newcarga" type="button">+ Cadastrar carga manualmente</button>'+
+    (isAdmin()?'<button class="btn ghost" data-act="newcarga" type="button">+ Cadastrar carga manualmente</button>':'')+
     '<button class="btn primary" data-act="report" type="button">Relatórios</button>'+
-    '<button class="btn ghost" data-act="ajustes" type="button">Ajustes, senha e cópia de segurança</button></div>';
+    (isAdmin()?'<button class="btn ghost" data-act="ajustes" type="button">Ajustes, senhas e cópia de segurança</button>':'')+
+    (isAdmin()&&info.guias.length?(S.confirmDelAll?
+      '<div class="banner warn" style="margin:0">Isso exclui TODAS as '+info.guias.length+' carga(s) e todas as conferências, em todos os aparelhos. Não dá para desfazer. Digite EXCLUIR para confirmar.</div>'+
+      '<div class="field"><label for="delAllIn">Digite EXCLUIR</label><input class="inp" id="delAllIn" autocomplete="off"></div>'+
+      '<button class="btn danger" data-act="del-all-yes" type="button">Excluir todas as cargas</button><button class="btn ghost" data-act="del-all-no" type="button">Cancelar</button>':
+      '<button class="btn ghost danger" data-act="del-all" type="button">Excluir todas as cargas</button>'):'')+
+    '<button class="btn ghost" data-act="sair" type="button">Sair</button></div>';
 }
 function renderCarga(){
   var fin=!!(S.guiaFin&&S.guiaFin.fin),g=info.guias.filter(function(x){return x.id===S.guiaId;})[0];
@@ -739,21 +769,26 @@ function renderCarga(){
   app.innerHTML=
     '<div class="intro"><div class="eyebrow">Carga'+(fin?' finalizada':'')+'</div><h1 class="title">'+esc(S.orderName||"Nova carga")+'</h1></div>'+
     '<div class="stack" style="margin-top:12px"><button class="btn" data-act="voltar-cargas" type="button">&larr; Voltar às cargas</button>'+
-    (fin?'<div class="banner ok">Carga finalizada em '+esc(brDate(dateOf(S.guiaFin.ts)))+(S.guiaFin.por?' por '+esc(S.guiaFin.por):'')+'.</div><button class="btn ghost" data-act="reabrir" type="button">Reabrir carga</button>':
+    (fin?'<div class="banner ok">Carga finalizada em '+esc(brDate(dateOf(S.guiaFin.ts)))+(S.guiaFin.por?' por '+esc(S.guiaFin.por):'')+'.</div>'+(podeFinalizar()?'<button class="btn ghost" data-act="reabrir" type="button">Reabrir carga</button>':''):
       '<div class="field"><label for="conf">Conferente (quem está conferindo)</label><input class="inp" id="conf" list="confList" autocomplete="off" placeholder="Nome de quem confere" value="'+esc(S.conferente||"")+'"><datalist id="confList">'+nomes().map(function(n){return '<option value="'+esc(n)+'">';}).join("")+'</datalist></div>'+
-      '<div class="field"><label for="orderName">Identificação da carga</label><input class="inp" id="orderName" placeholder="Ex.: Ordem de Carga 1215904" value="'+esc(S.orderName)+'"></div>')+
+      (isAdmin()?'<div class="field"><label for="orderName">Identificação da carga</label><input class="inp" id="orderName" placeholder="Ex.: Ordem de Carga 1215904" value="'+esc(S.orderName)+'"></div>':''))+
     pdfMsgHtml()+'</div>'+
     '<h2 class="sec-title">Clientes da carga</h2>'+
     '<div class="actions"><div class="field"><label for="busca">Buscar cliente ou nota fiscal</label><input class="inp" id="busca" autocomplete="off" placeholder="Nome ou número da nota" value="'+esc(S.busca||"")+'"></div>'+
     '<div class="field"><label for="fil">Mostrar</label><select class="inp" id="fil"><option value="">Todos</option><option value="nao"'+(S.fil==="nao"?" selected":"")+'>Falta conferir</option><option value="falta"'+(S.fil==="falta"?" selected":"")+'>Com falta</option><option value="ok"'+(S.fil==="ok"?" selected":"")+'>Conferidos</option></select></div></div>'+
     '<div class="stack" id="draftList" style="margin-top:10px"></div>'+
     '<div class="stack" style="margin-top:12px">'+
-    (fin?'':'<button class="btn ghost" data-act="dc-add" type="button">+ Adicionar cliente</button>'+
+    (isAdmin()&&!fin?'<button class="btn ghost" data-act="dc-add" type="button">+ Adicionar cliente</button>':'')+
+    (fin||!podeFinalizar()?'':
       (S.confirmFinCarga?
         '<div class="banner '+(t&&(t.nao||t.fa)?"warn":"ok")+'" style="margin:0">'+(t&&(t.nao||t.fa)?"Ainda há "+t.nao+" cliente(s) sem conferir e "+t.fa+" com falta. Finalizar a carga assim mesmo?":"Todos os clientes conferidos. Finalizar a carga?")+'</div>'+
         '<button class="btn primary" data-act="fin-carga-yes" type="button">Sim, finalizar carga</button><button class="btn ghost" data-act="fin-carga-no" type="button">Cancelar</button>':
         '<button class="btn primary" data-act="fin-carga" type="button">Finalizar carga</button>'))+
-    '<button class="btn" data-act="report" type="button">Relatórios</button></div>';
+    '<button class="btn" data-act="report" type="button">Relatórios</button>'+
+    (isAdmin()?(S.confirmDel?
+      '<div class="banner warn" style="margin:0">Excluir esta carga e as conferências dela, em todos os aparelhos? Não dá para desfazer.</div>'+
+      '<button class="btn danger" data-act="del-carga-yes" type="button">Sim, excluir esta carga</button><button class="btn ghost" data-act="del-carga-no" type="button">Cancelar</button>':
+      '<button class="btn ghost danger" data-act="del-carga" type="button">Excluir esta carga</button>'):'')+'</div>';
   renderDraft();
 }
 function itemRowHtml(d,ci,i){
@@ -780,7 +815,7 @@ function renderDraft(){
   });
   box.innerHTML='<div class="hint">'+S.draft.length+' cliente(s): '+nOk+' conferido(s), '+nF+' com falta, '+nN+' falta conferir.</div>'+
     (vis.length?vis.map(function(r){
-      var c=r.c,ci=r.ci,st=r.st,open=S.editC===ci,dif=c.expected&&c.expected!==c.items.length,x=st.x;
+      var c=r.c,ci=r.ci,st=r.st,open=isAdmin()&&S.editC===ci,dif=c.expected&&c.expected!==c.items.length,x=st.x;
       return '<div class="dcl"><div class="dcl-h"><div style="min-width:0"><b>'+esc(c.name||"Cliente sem nome")+'</b>'+
         (c.fantasia?'<div class="hint">'+esc(c.fantasia)+'</div>':'')+
         '<div class="hint mono">NF '+esc(c.nfs||"-")+'</div>'+
@@ -788,7 +823,7 @@ function renderDraft(){
         (x?'<div class="hint">Conferido por '+esc(x.rec.conferente||"não informado")+' em '+esc(brDate(x.rec.date))+' '+esc(x.rec.hora)+'</div>':'')+
         '<span class="pill '+st.cls+'" style="margin-top:6px">'+esc(st.label)+'</span></div>'+
         (isFin?'':'<div class="dcl-b"><button class="btn small primary" data-act="conf-client" data-c="'+ci+'" type="button">'+(x?"Conferir de novo":"Conferir")+'</button>'+
-        '<button class="btn small ghost" data-act="dc-toggle" data-c="'+ci+'" type="button">'+(open?"Fechar":"Editar")+'</button></div>')+'</div>'+
+        (isAdmin()?'<button class="btn small ghost" data-act="dc-toggle" data-c="'+ci+'" type="button">'+(open?"Fechar":"Editar")+'</button>':'')+'</div>')+'</div>'+
         (open?'<div class="stack" style="margin-top:10px">'+
           '<div class="field"><label for="cn'+ci+'">Cliente</label><input class="inp" id="cn'+ci+'" data-c="'+ci+'" data-f="name" value="'+esc(c.name)+'"></div>'+
           '<div class="field"><label for="cf'+ci+'">Notas fiscais (números sem pontos)</label><input class="inp mono" id="cf'+ci+'" data-c="'+ci+'" data-f="nfs" value="'+esc(c.nfs)+'"></div>'+
@@ -964,7 +999,22 @@ document.addEventListener("click",function(ev){
   var a=el.getAttribute("data-act");
   if(a==="close-bg"){if(ev.target!==el)return;a="close";}
   if(a==="unzoom"){S.zoom=null;renderOverlays();return;}
+  var SO_ADMIN=["pick-pdf","dc-add","dc-toggle","dc-add-item","dc-del-item","dc-del","newcarga","del-carga","del-carga-yes","del-carga-no","del-all","del-all-yes","del-all-no","ajustes","backup","restore","gen-senhas"];
+  var DE_FINAL=["fin-carga","fin-carga-yes","fin-carga-no","reabrir"];
+  if(SO_ADMIN.indexOf(a)>=0&&!isAdmin())return;
+  if(DE_FINAL.indexOf(a)>=0&&!podeFinalizar())return;
   switch(a){
+    case "del-carga":S.confirmDel=true;render();break;
+    case "del-carga-no":S.confirmDel=false;render();break;
+    case "del-carga-yes":
+      var gid=S.guiaId;excluirCargas(gid).then(function(n){S.draft=[];S.guiaId="";S.guiaFin={};S.orderName="";S.editC=-1;S.confirmDel=false;save();return loadInfo();}).then(function(){render();window.scrollTo(0,0);toast("Carga excluída.");}).catch(function(){toast("Não foi possível excluir.");});break;
+    case "del-all":S.confirmDelAll=true;render();break;
+    case "del-all-no":S.confirmDelAll=false;render();break;
+    case "del-all-yes":
+      var inp=document.getElementById("delAllIn");
+      if(!inp||inp.value.trim().toUpperCase()!=="EXCLUIR"){toast("Digite EXCLUIR para confirmar.");return;}
+      excluirCargas(null).then(function(n){S.confirmDelAll=false;return loadInfo();}).then(function(){render();toast("Todas as cargas foram excluídas.");}).catch(function(){toast("Não foi possível excluir.");});break;
+    case "gen-senhas":genSenhas();break;
     case "pick-pdf":pdfIn.value="";pdfIn.click();break;
     case "dc-add":S.draft.push({key:uid(),code:"",name:"",fantasia:"",address:"",obs:"",nfs:"",expected:0,items:[{name:"",qty:"",unit:""}]});S.editC=S.draft.length-1;if(!S.guiaId)S.guiaId=uid();renderDraft();save();break;
     case "dc-toggle":var tc=+el.getAttribute("data-c");var wasOpen=S.editC===tc;S.editC=wasOpen?-1:tc;renderDraft();if(wasOpen)saveGuia();break;
@@ -1036,8 +1086,6 @@ document.addEventListener("click",function(ev){
     case "rback":S.step=S.items.length?"check":"setup";save();render();window.scrollTo(0,0);break;
     case "download":downloadSheet();break;
     case "gate-enter":gateEnter();break;
-    case "gate-create":gateCreate();break;
-    case "change-pass":changePass();break;
     case "backup":doBackup();break;
     case "restore":document.getElementById("bkIn").click();break;
     case "sair":sair();break;
@@ -1071,9 +1119,9 @@ document.addEventListener("input",function(ev){
   }
 });
 document.addEventListener("keydown",function(ev){
-  if(ev.key==="Enter"&&ev.target&&(ev.target.id==="gPass"||ev.target.id==="gPass2")){if(document.getElementById("gPass2"))gateCreate();else gateEnter();}
+  if(ev.key==="Enter"&&ev.target&&ev.target.id==="gPass"){gateEnter();}
 });
-document.getElementById("bkIn").addEventListener("change",function(ev){var f=ev.target.files&&ev.target.files[0];if(f)doRestore(f);ev.target.value="";});
+document.getElementById("bkIn").addEventListener("change",function(ev){var f=ev.target.files&&ev.target.files[0];if(f&&isAdmin())doRestore(f);ev.target.value="";});
 document.addEventListener("change",function(ev){
   var t=ev.target;
   if(t.id==="fil"){S.fil=t.value;renderDraft();}
@@ -1082,7 +1130,7 @@ document.addEventListener("change",function(ev){
   else if(t.id==="repFil"){S.repFil=t.value;renderReport();}
   else if(t.id==="repOrd"){S.repOrd=t.value;renderReport();}
 });
-pdfIn.addEventListener("change",function(){if(pdfIn.files&&pdfIn.files[0])readPdf(pdfIn.files[0]);});
+pdfIn.addEventListener("change",function(){if(isAdmin()&&pdfIn.files&&pdfIn.files[0])readPdf(pdfIn.files[0]);});
 photoIn.addEventListener("change",function(){
   var f=photoIn.files&&photoIn.files[0];if(!f)return;
   var qi=document.getElementById("qtyIn");if(qi)sheet.qty=qi.value;
