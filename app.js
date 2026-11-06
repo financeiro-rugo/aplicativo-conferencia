@@ -1,4 +1,4 @@
-(function(){
+function(){
 "use strict";
 
 /* ==========================================================================
@@ -107,9 +107,18 @@ function syncPushRecord(rec){
   }));}catch(e){return;}
   syncPost({acao:"syncRecord",id:String(clean.id),record:clean,updatedAt:Date.now()});
 }
+function syncHasActiveEditor(){
+  var el=document.activeElement;
+  if(!el)return false;
+  var tag=(el.tagName||"").toLowerCase();
+  return tag==="input"||tag==="textarea"||tag==="select"||el.isContentEditable===true;
+}
 function syncApplyState(state,updatedAt){
   if(!state||!updatedAt||updatedAt<=syncLastRemote)return;
-  if(Date.now()-syncLastLocal<4000)return; // evita substituir edição local recente
+  // Não substitui o estado local enquanto a pessoa estiver digitando.
+  // O próximo ciclo de sincronização tentará novamente.
+  if(syncHasActiveEditor())return;
+  if(Date.now()-syncLastLocal<4000)return;
   syncLastRemote=updatedAt;
   syncApplying=true;
   try{
@@ -143,7 +152,8 @@ function syncPull(){
     chain.then(function(){
       syncApplying=false;
       if(data.state)syncApplyState(data.state.state,data.state.updatedAt);
-      loadInfo();
+      // Não chamar loadInfo() aqui: ele redesenha a tela a cada ciclo
+      // e pode interromper a digitação/seleção no celular.
     }).catch(function(){syncApplying=false;});
   }).catch(function(err){console.warn("Sincronização: consulta falhou",err);});
 }
