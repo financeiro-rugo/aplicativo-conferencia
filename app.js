@@ -30,38 +30,32 @@ function parseNum(s){
 /* ---------- sincronização central (Google Apps Script / Planilhas Google) ----------
    Só os DADOS são compartilhados: cargas (guias) e conferências salvas.
    A tela e a conferência em andamento ficam em cada aparelho, para um não derrubar o outro. */
-var URL_GOOGLE_SCRIPT = "https://script.google.com/macros/s/AKfycby8thnuRK9J_ScgTCqo3g8QWRFfArN8Zdy-KPgrOvQCydR3A6P70kMikQhjNH3X3Xi3YA/exec";
-var SENHA_SERVIDOR = "1234"; // temporária; troque aqui e no Apps Script
+var WORKER_URL = "https://rugo-conferencia-api.financeirorugo.workers.dev";
+var API_TOKEN = "";
 var SYNC_INTERVAL_MS = 6000;
-/* SENHAS DE ACESSO (guardadas só como "hash"; para trocar use Ajustes > Senhas, com a senha de administrador)
-   Senhas padrão: administrador = admin1234 | equipe = equipe1234. Troque antes de usar. */
-var SALT_SENHA = "cc-conferencia-v1";
-var HASH_ADMIN = "086d7fdca25dd4ff133d76a6cedead693ddd7282be5bf11b427cca5aab045b88";
-var HASH_EQUIPE = "e09d8aee11912d19ecefca5174f48879ec7e4b8a0674e94429703d1056c77ed8";
-var EQUIPE_PODE_FINALIZAR = false; // true = a equipe também pode finalizar/reabrir cargas
 var syncStarted = false, syncBusy = false;
-function syncJsonp(params){
-  return new Promise(function(resolve,reject){
-    if(!URL_GOOGLE_SCRIPT){reject(new Error("URL do Apps Script não configurada"));return;}
-    var cb="__ccSync_"+uid()+"_"+Date.now();
-    var script=document.createElement("script");
-    var timer=setTimeout(function(){cleanup();reject(new Error("Tempo esgotado ao consultar servidor"));},20000);
-    function cleanup(){clearTimeout(timer);try{delete window[cb];}catch(e){window[cb]=undefined;}if(script.parentNode)script.parentNode.removeChild(script);}
-    window[cb]=function(data){cleanup();resolve(data);};
-    params=params||{};params.callback=cb;
-    var q=Object.keys(params).map(function(k){return encodeURIComponent(k)+"="+encodeURIComponent(params[k]);}).join("&");
-    script.onerror=function(){cleanup();reject(new Error("Falha ao consultar Google Apps Script"));};
-    script.src=URL_GOOGLE_SCRIPT+"?"+q;
-    document.head.appendChild(script);
+function apiHeaders(){
+  var h={"Content-Type":"application/json"};
+  if(API_TOKEN)h.Authorization="Bearer "+API_TOKEN;
+  return h;
+}
+function apiRequest(path,options){
+  options=options||{};
+  options.headers=apiHeaders();
+  return fetch(WORKER_URL+path,options).then(function(r){
+    return r.json().then(function(data){
+      if(!r.ok)throw new Error(data.erro||data.mensagem||"Falha na comunicação com o servidor");
+      return data;
+    });
   });
 }
 var syncQ=Promise.resolve();
 function syncPost(payload){
-  if(!URL_GOOGLE_SCRIPT)return Promise.resolve();
-  payload.senha=SENHA_SERVIDOR;
+  if(!API_TOKEN||!unlocked)return Promise.resolve();
   var body=JSON.stringify(payload);
   syncQ=syncQ.then(function(){
-    return fetch(URL_GOOGLE_SCRIPT,{method:"POST",mode:"no-cors",headers:{"Content-Type":"text/plain;charset=utf-8"},body:body})
+    return apiRequest("/sync",{method:"POST",body:body})
+      .then(function(data){if(data&&data.status==="erro")throw new Error(data.mensagem||"Falha ao sincronizar");return data;})
       .catch(function(err){console.warn("Sincronização: falha de envio",err);});
   });
   return syncQ;
@@ -85,7 +79,7 @@ function dbPutIfNewer(rec){
   });});
 }
 function syncPushRecord(rec){
-  if(!rec||!rec.id||!URL_GOOGLE_SCRIPT)return;
+  if(!rec||!rec.id||!API_TOKEN)return;
   var clean;
   try{clean=JSON.parse(JSON.stringify(rec,function(k,v){
     if(k==="foto"||k==="photo"||k==="fotoData"||k==="blob")return undefined;
@@ -106,9 +100,9 @@ function syncRefresh(){
   });
 }
 function syncPull(force){
-  if(!URL_GOOGLE_SCRIPT||(!force&&(syncBusy||document.hidden)))return Promise.resolve();
+  if(!API_TOKEN||!unlocked||(!force&&(syncBusy||document.hidden)))return Promise.resolve();
   syncBusy=true;
-  return syncJsonp({acao:"syncList",senha:SENHA_SERVIDOR}).then(function(data){
+  return apiRequest("/syncList",{method:"GET"}).then(function(data){
     if(!data||data.status!=="sucesso")return;
     var changed=0,chain=Promise.resolve();
     (data.records||[]).forEach(function(item){
@@ -120,14 +114,14 @@ function syncPull(force){
   }).catch(function(err){console.warn("Sincronização: consulta falhou",err);}).then(function(){syncBusy=false;});
 }
 function startSync(){
-  if(syncStarted||!URL_GOOGLE_SCRIPT)return;
+  if(syncStarted||!API_TOKEN||!unlocked)return;
   syncStarted=true;syncPull();
   setInterval(syncPull,SYNC_INTERVAL_MS);
   document.addEventListener("visibilitychange",function(){if(!document.hidden)syncPull();});
 }
 /* resumo por cliente enviado para a planilha (aba de resumo) */
 function enviarParaGoogleSheets(rec){
-  if(!URL_GOOGLE_SCRIPT)return;
+  if(!API_TOKEN||!unlocked)return;
   recClients(rec).forEach(function(c){
     var comp=0,fal=0;c.items.forEach(function(i){if(i.falta===0)comp++;else fal++;});
     syncPost({acao:"salvar",ordem:rec.order,cliente:c.name,notasFiscais:c.nfs,situacao:fal?"Conferido com falta":"Conferido",
@@ -157,60 +151,13 @@ function restore(){
 var SKEY="conferencia-senha-v1",SESS="conferencia-sessao-v1",NKEY="conferencia-conferentes-v1";
 var unlocked=false,role="";
 function isAdmin(){return role==="admin";}
-function podeFinalizar(){return role==="admin"||EQUIPE_PODE_FINALIZAR;}
+function podeFinalizar(){return role==="admin";}
 var report={loading:false,recs:[],err:"",names:[]};
 var reportToken=0;
 function pad(n){return n<10?"0"+n:""+n;}
 function todayStr(){var d=new Date();return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate());}
 function nowHour(){var d=new Date();return pad(d.getHours())+":"+pad(d.getMinutes());}
 function brDate(s){return String(s).split("-").reverse().join("/");}
-
-/* SHA-256 em JavaScript puro (funciona também em endereços sem HTTPS) */
-function sha256(ascii){
-  function rr(v,a){return (v>>>a)|(v<<(32-a));}
-  var mp=Math.pow,mw=mp(2,32),i,j,result="",words=[],bl=ascii.length*8;
-  var hash=sha256.h=sha256.h||[],k=sha256.k=sha256.k||[],pc=k.length,comp={};
-  for(var c=2;pc<64;c++){
-    if(!comp[c]){
-      for(i=0;i<313;i+=c)comp[i]=c;
-      hash[pc]=(mp(c,0.5)*mw)|0;k[pc++]=(mp(c,1/3)*mw)|0;
-    }
-  }
-  ascii+="\x80";
-  while(ascii.length%64-56)ascii+="\x00";
-  for(i=0;i<ascii.length;i++){
-    j=ascii.charCodeAt(i);
-    if(j>>8)return "";
-    words[i>>2]|=j<<((3-i)%4)*8;
-  }
-  words[words.length]=((bl/mw)|0);
-  words[words.length]=bl;
-  for(j=0;j<words.length;){
-    var w=words.slice(j,j+=16),old=hash;
-    hash=hash.slice(0,8);
-    for(i=0;i<64;i++){
-      var w15=w[i-15],w2=w[i-2],a=hash[0],e=hash[4];
-      var t1=hash[7]+(rr(e,6)^rr(e,11)^rr(e,25))+((e&hash[5])^((~e)&hash[6]))+k[i]+(w[i]=(i<16)?w[i]:(w[i-16]+(rr(w15,7)^rr(w15,18)^(w15>>>3))+w[i-7]+(rr(w2,17)^rr(w2,19)^(w2>>>10)))|0);
-      var t2=(rr(a,2)^rr(a,13)^rr(a,22))+((a&hash[1])^(a&hash[2])^(hash[1]&hash[2]));
-      hash=[(t1+t2)|0].concat(hash);
-      hash[4]=(hash[4]+t1)|0;
-    }
-    for(i=0;i<8;i++)hash[i]=(hash[i]+old[i])|0;
-  }
-  for(i=0;i<8;i++)for(j=3;j+1;j--){var b=(hash[i]>>(j*8))&255;result+=((b<16)?0:"")+b.toString(16);}
-  return result;
-}
-function hashSenha(pass,salt){
-  var h=sha256(unescape(encodeURIComponent(salt+pass)));
-  for(var i=0;i<2000;i++)h=sha256(h+salt);
-  return h;
-}
-function roleDe(pass){
-  var h=hashSenha(pass,SALT_SENHA);
-  if(h===HASH_ADMIN)return "admin";
-  if(h===HASH_EQUIPE)return "equipe";
-  return "";
-}
 
 /* banco de dados do navegador (IndexedDB) */
 var idbP=null;
@@ -310,17 +257,35 @@ function renderGate(msg){
     '<div class="status'+(msg?" err":"")+'" id="gStatus" role="status">'+esc(msg||"")+'</div>'+
     '<button class="btn primary" id="gBtn" data-act="gate-enter" type="button">Entrar</button></div>';
 }
-function unlock(r){role=r;unlocked=true;try{sessionStorage.setItem(SESS,r);}catch(e){}S.step=S.items.length?"check":"setup";render();}
+function unlock(r,token){
+  role=r;API_TOKEN=token||"";unlocked=true;
+  try{sessionStorage.setItem(SESS,r);sessionStorage.setItem("conferencia-api-token",API_TOKEN);}catch(e){}
+  S.step=S.items.length?"check":"setup";render();startSync();
+}
 function gateEnter(){
   var p=document.getElementById("gPass").value||"",st=document.getElementById("gStatus");
   if(!p){st.textContent="Digite a senha.";st.className="status err";return;}
-  st.textContent="Conferindo...";st.className="status";
-  setTimeout(function(){var r=roleDe(p);if(r)unlock(r);else{st.textContent="Senha incorreta.";st.className="status err";}},20);
+  st.textContent="Validando acesso...";st.className="status";
+  apiRequest("/login",{method:"POST",body:JSON.stringify({password:p})}).then(function(data){
+    if(data.status!=="sucesso"||!data.token||!data.role)throw new Error("Resposta inválida do login.");
+    unlock(data.role,data.token);
+  }).catch(function(err){
+    st.textContent=err.message||"Senha incorreta.";st.className="status err";
+  });
 }
-function sair(){unlocked=false;role="";try{sessionStorage.removeItem(SESS);}catch(e){}S.step=S.items.length?"check":"setup";render();}
+function sair(){
+  unlocked=false;role="";API_TOKEN="";
+  try{sessionStorage.removeItem(SESS);sessionStorage.removeItem("conferencia-api-token");}catch(e){}
+  S.step=S.items.length?"check":"setup";render();
+}
 function startup(){
-  try{var r0=sessionStorage.getItem(SESS);if(r0==="admin"||r0==="equipe"){role=r0;unlocked=true;}else unlocked=false;}catch(e){unlocked=false;}
-  render();startSync();
+  try{
+    var r0=sessionStorage.getItem(SESS),t0=sessionStorage.getItem("conferencia-api-token");
+    if((r0==="admin"||r0==="equipe")&&t0){role=r0;API_TOKEN=t0;unlocked=true;}
+    else{role="";API_TOKEN="";unlocked=false;}
+  }catch(e){unlocked=false;API_TOKEN="";}
+  render();
+  if(unlocked)startSync();
 }
 
 /* conferentes */
@@ -540,32 +505,12 @@ function downloadSheet(){
 /* ajustes: senha e backup */
 function renderSettings(){
   app.innerHTML='<div class="top"><div class="eyebrow">Aplicativo</div><h1 class="title">Ajustes</h1></div>'+
-    '<h2 class="sec-title">Senhas de acesso</h2><div class="stack">'+
-    '<div class="hint">Administrador: anexa, edita e exclui cargas. Equipe: só confere. As senhas valem em todos os aparelhos porque ficam no arquivo app.js. Digite as novas, copie as 2 linhas geradas e cole no app.js do GitHub no lugar das linhas HASH_ADMIN e HASH_EQUIPE.</div>'+
-    '<div class="field"><label for="pAdm">Nova senha do administrador</label><input class="inp" id="pAdm" type="password" autocomplete="new-password"></div>'+
-    '<div class="field"><label for="pEq">Nova senha da equipe</label><input class="inp" id="pEq" type="password" autocomplete="new-password"></div>'+
-    '<div class="status" id="pStatus" role="status"></div>'+
-    '<button class="btn" data-act="gen-senhas" type="button">Gerar linhas para o app.js</button>'+
-    '<textarea class="inp mono" id="pOut" rows="4" readonly style="display:none"></textarea></div>'+
-    '<h2 class="sec-title">Cópia de segurança</h2><div class="stack">'+
+    '<h2 class="sec-title">Acesso e segurança</h2><div class="hint">As senhas são gerenciadas com segurança no Cloudflare. Para alterá-las, solicite ao administrador do sistema. Não ficam armazenadas neste aplicativo.</div><h2 class="sec-title">Cópia de segurança</h2><div class="stack">'+
     '<div class="hint">Baixe uma cópia de vez em quando e guarde em outro lugar. As cargas também ficam na planilha do Google.</div>'+
     '<button class="btn" data-act="backup" type="button">Baixar cópia de segurança (.json)</button>'+
     '<button class="btn ghost" data-act="restore" type="button">Restaurar uma cópia</button></div>'+
     '<div class="stack" style="margin-top:22px"><button class="btn danger" data-act="sair" type="button">Sair do aplicativo</button>'+
     '<button class="btn" data-act="rback" type="button">Voltar</button></div>';
-}
-function genSenhas(){
-  var a=document.getElementById("pAdm").value||"",e=document.getElementById("pEq").value||"",st=document.getElementById("pStatus"),out=document.getElementById("pOut");
-  function say(t,ok){st.textContent=t;st.className="status"+(ok?"":" err");}
-  if(a&&a.length<6||e&&e.length<6){say("Use pelo menos 6 caracteres.");return;}
-  if(!a&&!e){say("Digite pelo menos uma senha nova.");return;}
-  if(a&&e&&a===e){say("As duas senhas precisam ser diferentes.");return;}
-  say("Gerando...",true);
-  setTimeout(function(){
-    out.value='var HASH_ADMIN = "'+(a?hashSenha(a,SALT_SENHA):HASH_ADMIN)+'";\nvar HASH_EQUIPE = "'+(e?hashSenha(e,SALT_SENHA):HASH_EQUIPE)+'";';
-    out.style.display="block";out.select();
-    say("Copie as 2 linhas abaixo e cole no app.js (GitHub). Depois da publicação, as senhas novas valem em todos os aparelhos.",true);
-  },20);
 }
 function blobToDataUrl(b){return new Promise(function(res,rej){var f=new FileReader();f.onload=function(){res(f.result);};f.onerror=rej;f.readAsDataURL(b);});}
 function doBackup(){
@@ -1011,7 +956,7 @@ document.addEventListener("click",function(ev){
   var a=el.getAttribute("data-act");
   if(a==="close-bg"){if(ev.target!==el)return;a="close";}
   if(a==="unzoom"){S.zoom=null;renderOverlays();return;}
-  var SO_ADMIN=["pick-pdf","dc-add","dc-toggle","dc-add-item","dc-del-item","dc-del","newcarga","del-carga","del-carga-yes","del-carga-no","del-all","del-all-yes","del-all-no","ajustes","backup","restore","gen-senhas"];
+  var SO_ADMIN=["pick-pdf","dc-add","dc-toggle","dc-add-item","dc-del-item","dc-del","newcarga","del-carga","del-carga-yes","del-carga-no","del-all","del-all-yes","del-all-no","ajustes","backup","restore"];
   var DE_FINAL=["fin-carga","fin-carga-yes","fin-carga-no","reabrir"];
   if(SO_ADMIN.indexOf(a)>=0&&!isAdmin())return;
   if(DE_FINAL.indexOf(a)>=0&&!podeFinalizar())return;
@@ -1026,7 +971,6 @@ document.addEventListener("click",function(ev){
       var inp=document.getElementById("delAllIn");
       if(!inp||inp.value.trim().toUpperCase()!=="EXCLUIR"){toast("Digite EXCLUIR para confirmar.");return;}
       excluirCargas(null).then(function(n){S.confirmDelAll=false;return loadInfo();}).then(function(){render();toast("Todas as cargas foram excluídas.");}).catch(function(){toast("Não foi possível excluir.");});break;
-    case "gen-senhas":genSenhas();break;
     case "pick-pdf":pdfIn.value="";pdfIn.click();break;
     case "dc-add":S.draft.push({key:uid(),code:"",name:"",fantasia:"",address:"",obs:"",nfs:"",expected:0,items:[{name:"",qty:"",unit:""}]});S.editC=S.draft.length-1;if(!S.guiaId)S.guiaId=uid();renderDraft();save();break;
     case "dc-toggle":var tc=+el.getAttribute("data-c");var wasOpen=S.editC===tc;S.editC=wasOpen?-1:tc;renderDraft();if(wasOpen)saveGuia();break;
