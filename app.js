@@ -1,27 +1,5 @@
 (function(){
 "use strict";
-
-/* ==========================================================================
-   CONFIGURAÇÃO DA PLANILHA NO GOOGLE SHEETS
-   ========================================================================== */
-var URL_GOOGLE_SCRIPT = "https://script.google.com/macros/s/AKfycby8thnuRK9J_ScgTCqo3g8QWRFfArN8Zdy-KPgrOvQCydR3A6P70kMikQhjNH3X3Xi3YA/exec";
-var SENHA_SERVIDOR = "1234"; // temporário; altere no app e no Apps Script
-var SYNC_INTERVAL_MS = 5000;
-var SYNC_STATE_ID = "estado-conferencia-compartilhado";
-var syncApplying = false;
-var syncStarted = false;
-var syncLastLocal = 0;
-var syncLastRemote = 0;
-var syncTimer = null;
-var syncSaveTimer = null;
-var syncDeviceId = (function(){
-  try {
-    var k="conferencia-device-id-v1", v=localStorage.getItem(k);
-    if(!v){v=uid();localStorage.setItem(k,v);}
-    return v;
-  } catch(e){return uid();}
-})();
-
 var KEY="conferencia-carga-v1";
 var app=document.getElementById("app");
 var overlays=document.getElementById("overlays");
@@ -49,14 +27,19 @@ function parseNum(s){
   return parseFloat(s);
 }
 
-
-/* ---------- sincronização central (Google Apps Script) ---------- */
+/* ---------- sincronização central (Google Apps Script / Planilhas Google) ----------
+   Só os DADOS são compartilhados: cargas (guias) e conferências salvas.
+   A tela e a conferência em andamento ficam em cada aparelho, para um não derrubar o outro. */
+var URL_GOOGLE_SCRIPT = "https://script.google.com/macros/s/AKfycby8thnuRK9J_ScgTCqo3g8QWRFfArN8Zdy-KPgrOvQCydR3A6P70kMikQhjNH3X3Xi3YA/exec";
+var SENHA_SERVIDOR = "1234"; // temporária; troque aqui e no Apps Script
+var SYNC_INTERVAL_MS = 6000;
+var syncStarted = false, syncBusy = false;
 function syncJsonp(params){
   return new Promise(function(resolve,reject){
     if(!URL_GOOGLE_SCRIPT){reject(new Error("URL do Apps Script não configurada"));return;}
     var cb="__ccSync_"+uid()+"_"+Date.now();
     var script=document.createElement("script");
-    var timer=setTimeout(function(){cleanup();reject(new Error("Tempo esgotado ao consultar servidor"));},15000);
+    var timer=setTimeout(function(){cleanup();reject(new Error("Tempo esgotado ao consultar servidor"));},20000);
     function cleanup(){clearTimeout(timer);try{delete window[cb];}catch(e){window[cb]=undefined;}if(script.parentNode)script.parentNode.removeChild(script);}
     window[cb]=function(data){cleanup();resolve(data);};
     params=params||{};params.callback=cb;
@@ -66,125 +49,103 @@ function syncJsonp(params){
     document.head.appendChild(script);
   });
 }
+var syncQ=Promise.resolve();
 function syncPost(payload){
   if(!URL_GOOGLE_SCRIPT)return Promise.resolve();
   payload.senha=SENHA_SERVIDOR;
-  return fetch(URL_GOOGLE_SCRIPT,{
-    method:"POST",mode:"no-cors",
-    headers:{"Content-Type":"text/plain;charset=utf-8"},
-    body:JSON.stringify(payload)
-  }).catch(function(err){console.warn("Sincronização: falha de envio",err);});
+  var body=JSON.stringify(payload);
+  syncQ=syncQ.then(function(){
+    return fetch(URL_GOOGLE_SCRIPT,{method:"POST",mode:"no-cors",headers:{"Content-Type":"text/plain;charset=utf-8"},body:body})
+      .catch(function(err){console.warn("Sincronização: falha de envio",err);});
+  });
+  return syncQ;
 }
-function syncStatePayload(){
-  // Sheets sincroniza quantidades e dados; fotos/blob ficam locais neste MVP.
-  var state={
-    step:S.step,orderId:S.orderId,orderName:S.orderName,conferente:S.conferente,
-    draft:S.draft,items:S.items,clients:S.clients,guiaId:S.guiaId||"",
-    openClient:S.openClient||null,updatedAt:Date.now(),deviceId:syncDeviceId
-  };
-  return JSON.parse(JSON.stringify(state,function(k,v){
-    if(k==="photo"||k==="foto"||k==="fotoData"||k==="blob")return undefined;
-    if(typeof Blob!=="undefined"&&v instanceof Blob)return undefined;
-    return v;
-  }));
-}
-function syncQueueState(){
-  if(syncApplying||!URL_GOOGLE_SCRIPT)return;
-  syncLastLocal=Date.now();
-  clearTimeout(syncSaveTimer);
-  syncSaveTimer=setTimeout(function(){
-    syncPost({acao:"syncState",id:SYNC_STATE_ID,updatedAt:syncLastLocal,state:syncStatePayload()});
-  },700);
+/* grava o registro vindo do servidor só se for mais novo que o local, numa única transação (sem corrida com um salvamento local) */
+function dbPutIfNewer(rec){
+  return idb().then(function(db){return new Promise(function(res,rej){
+    var tx=db.transaction("cargas","readwrite"),st=tx.objectStore("cargas"),done=false,g=st.get(rec.id);
+    g.onsuccess=function(){
+      var local=g.result;
+      if(!local||Number(rec._syncUpdatedAt||0)>Number(local._syncUpdatedAt||0)){
+        if(local)recClients(local).forEach(function(c,ci){ /* mantém as fotos que já estão neste aparelho */
+          var rc=recClients(rec)[ci];if(!rc)return;
+          c.items.forEach(function(it,ii){var ri=rc.items[ii];if(!ri||!it.regs)return;if(!ri.regs||!ri.regs.length)ri.regs=it.regs;});});
+        st.put(rec);done=true;
+      }
+    };
+    tx.oncomplete=function(){res(done);};tx.onerror=tx.onabort=function(){rej(tx.error);};
+  });});
 }
 function syncPushRecord(rec){
-  if(syncApplying||!rec||!rec.id)return;
-  // photos/blobs remain local; records and quantities are synced centrally.
+  if(!rec||!rec.id||!URL_GOOGLE_SCRIPT)return;
   var clean;
   try{clean=JSON.parse(JSON.stringify(rec,function(k,v){
     if(k==="foto"||k==="photo"||k==="fotoData"||k==="blob")return undefined;
     if(typeof Blob!=="undefined"&&v instanceof Blob)return undefined;
     return v;
   }));}catch(e){return;}
-  syncPost({acao:"syncRecord",id:String(clean.id),record:clean,updatedAt:Date.now()});
+  syncPost({acao:"syncRecord",id:String(clean.id),record:clean,updatedAt:rec._syncUpdatedAt||Date.now()});
 }
 function syncHasActiveEditor(){
-  var el=document.activeElement;
-  if(!el)return false;
+  var el=document.activeElement;if(!el)return false;
   var tag=(el.tagName||"").toLowerCase();
   return tag==="input"||tag==="textarea"||tag==="select"||el.isContentEditable===true;
 }
-function syncApplyState(state,updatedAt){
-  if(!state||!updatedAt||updatedAt<=syncLastRemote)return;
-  // Não substitui o estado local enquanto a pessoa estiver digitando.
-  // O próximo ciclo de sincronização tentará novamente.
-  if(syncHasActiveEditor())return;
-  if(Date.now()-syncLastLocal<4000)return;
-  syncLastRemote=updatedAt;
-  syncApplying=true;
-  try{
-    S.step=state.step||"setup";S.orderId=state.orderId||"";S.orderName=state.orderName||"";
-    S.conferente=state.conferente||"";S.draft=state.draft||[];S.items=state.items||[];
-    S.clients=state.clients||[];S.guiaId=state.guiaId||"";S.openClient=state.openClient||null;
-    localStorage.setItem(KEY,JSON.stringify(state));
-    render();
-  }catch(e){console.warn("Não foi possível aplicar estado remoto",e);}
-  finally{syncApplying=false;}
+/* depois de receber dados novos: atualiza só as listas, e só nas telas de lista; a conferência em andamento nunca é mexida */
+function syncRefresh(){
+  loadInfo(true).then(function(){
+    if(S.step==="report"&&!syncHasActiveEditor())loadReport(true);
+  });
 }
 function syncPull(){
-  if(!URL_GOOGLE_SCRIPT||syncApplying)return;
+  if(!URL_GOOGLE_SCRIPT||syncBusy||document.hidden)return;
+  syncBusy=true;
   syncJsonp({acao:"syncList",senha:SENHA_SERVIDOR}).then(function(data){
     if(!data||data.status!=="sucesso")return;
-    syncApplying=true;
-    var records=data.records||[];
-    var chain=Promise.resolve();
-    records.forEach(function(item){
-      if(item&&item.record&&item.record.id){
-        chain=chain.then(function(){
-          return dbGet(item.record.id).then(function(local){
-            if(!local||Number(item.updatedAt||0)>Number(local._syncUpdatedAt||0)){
-              item.record._syncUpdatedAt=Number(item.updatedAt||Date.now());
-              return dbPutLocal(item.record);
-            }
-          });
-        });
-      }
+    var changed=0,chain=Promise.resolve();
+    (data.records||[]).forEach(function(item){
+      if(!item||!item.record||!item.record.id)return;
+      item.record._syncUpdatedAt=Number(item.updatedAt||0)||Date.now();
+      chain=chain.then(function(){return dbPutIfNewer(item.record).then(function(ok){if(ok)changed++;});});
     });
-    chain.then(function(){
-      syncApplying=false;
-      if(data.state)syncApplyState(data.state.state,data.state.updatedAt);
-      // Não chamar loadInfo() aqui: ele redesenha a tela a cada ciclo
-      // e pode interromper a digitação/seleção no celular.
-    }).catch(function(){syncApplying=false;});
-  }).catch(function(err){console.warn("Sincronização: consulta falhou",err);});
+    return chain.then(function(){if(changed)syncRefresh();});
+  }).catch(function(err){console.warn("Sincronização: consulta falhou",err);}).then(function(){syncBusy=false;});
 }
-function dbPutLocal(rec){return idbDo("readwrite",function(st){return st.put(rec);});}
 function startSync(){
   if(syncStarted||!URL_GOOGLE_SCRIPT)return;
-  syncStarted=true;
-  syncPull();
-  syncTimer=setInterval(syncPull,SYNC_INTERVAL_MS);
+  syncStarted=true;syncPull();
+  setInterval(syncPull,SYNC_INTERVAL_MS);
+  document.addEventListener("visibilitychange",function(){if(!document.hidden)syncPull();});
+}
+/* resumo por cliente enviado para a planilha (aba de resumo) */
+function enviarParaGoogleSheets(rec){
+  if(!URL_GOOGLE_SCRIPT)return;
+  recClients(rec).forEach(function(c){
+    var comp=0,fal=0;c.items.forEach(function(i){if(i.falta===0)comp++;else fal++;});
+    syncPost({acao:"salvar",ordem:rec.order,cliente:c.name,notasFiscais:c.nfs,situacao:fal?"Conferido com falta":"Conferido",
+      produtos:c.items.length,produtosCompletos:comp,produtosComFalta:fal,conferente:rec.conferente,data:brDate(rec.date),hora:rec.hora});
+  });
 }
 
 function save(){
   try{
-    localStorage.setItem(KEY,JSON.stringify({step:(S.step==="report"||S.step==="ajustes")?(S.items.length?"check":"setup"):S.step,orderId:S.orderId,orderName:S.orderName,conferente:S.conferente,draft:S.draft,items:S.items,clients:S.clients,guiaId:S.guiaId||"",openClient:S.openClient||null}));
+    localStorage.setItem(KEY,JSON.stringify({step:(S.step==="report"||S.step==="ajustes")?(S.items.length?"check":"setup"):S.step,orderId:S.orderId,orderName:S.orderName,conferente:S.conferente,draft:S.draft,items:S.items,clients:S.clients,guiaId:S.guiaId||"",guiaFin:S.guiaFin||{},openClient:S.openClient||null}));
   }catch(e){
     if(!warnedStorage){warnedStorage=true;toast("Memória do navegador cheia. Finalize e salve a carga atual.");}
   }
-  syncQueueState();
 }
 function restore(){
   try{
     var raw=localStorage.getItem(KEY);
     if(!raw)return;
     var d=JSON.parse(raw);
-    if(d&&d.items){S.step=d.step||"setup";S.orderId=d.orderId||"";S.orderName=d.orderName||"";S.conferente=d.conferente||"";S.draft=d.draft||[];S.items=d.items||[];S.clients=d.clients||[];S.guiaId=d.guiaId||"";S.openClient=d.openClient||null;
+    if(d&&d.items){S.step=d.step||"setup";S.orderId=d.orderId||"";S.orderName=d.orderName||"";S.conferente=d.conferente||"";S.draft=d.draft||[];S.items=d.items||[];S.clients=d.clients||[];S.guiaId=d.guiaId||"";S.guiaFin=d.guiaFin||{};S.openClient=d.openClient||null;
       if(S.items.length&&!S.clients.length){S.clients=[{id:"c0",code:"",name:"Sem cliente",fantasia:"",address:"",obs:"",nfs:"",expected:0}];S.items.forEach(function(i){i.cid="c0";});}
       if(S.draft.length&&!S.draft[0].items)S.draft=[{code:"",name:"",fantasia:"",address:"",obs:"",nfs:"",expected:0,items:S.draft}];}
   }catch(e){}
 }
 
-/* ---------- senha, dados e relatório ---------- */
+/* ---------- senha, dados e relatório (neste computador) ---------- */
 var SKEY="conferencia-senha-v1",SESS="conferencia-sessao-v1",NKEY="conferencia-conferentes-v1";
 var unlocked=false;
 var report={loading:false,recs:[],err:"",names:[]};
@@ -194,7 +155,7 @@ function todayStr(){var d=new Date();return d.getFullYear()+"-"+pad(d.getMonth()
 function nowHour(){var d=new Date();return pad(d.getHours())+":"+pad(d.getMinutes());}
 function brDate(s){return String(s).split("-").reverse().join("/");}
 
-/* SHA-256 */
+/* SHA-256 em JavaScript puro (funciona também em endereços sem HTTPS) */
 function sha256(ascii){
   function rr(v,a){return (v>>>a)|(v<<(32-a));}
   var mp=Math.pow,mw=mp(2,32),i,j,result="",words=[],bl=ascii.length*8;
@@ -263,9 +224,8 @@ function idbDo(mode,fn){
   });
 }
 function dbPut(rec){
-  return idbDo("readwrite",function(s){return s.put(rec);}).then(function(){
-    syncPushRecord(rec); return rec;
-  });
+  rec._syncUpdatedAt=Date.now();
+  return idbDo("readwrite",function(s){return s.put(rec);}).then(function(){syncPushRecord(rec);return rec;});
 }
 function dbAll(){return idbDo("readonly",function(s){return s.getAll();});}
 function dbGet(id){return idbDo("readonly",function(s){return s.get(id);});}
@@ -273,7 +233,7 @@ function dbGet(id){return idbDo("readonly",function(s){return s.get(id);});}
 /* guias salvas e situação de cada cliente */
 var info={guias:[],last:{}};
 function ensureKeys(){S.draft.forEach(function(c){if(!c.key)c.key=uid();});}
-function loadInfo(){
+function loadInfo(quiet){
   return dbAll().then(function(all){
     all=all||[];
     info.guias=all.filter(function(r){return r.kind==="guia";}).sort(function(a,b){return b.ts-a.ts;});
@@ -282,11 +242,11 @@ function loadInfo(){
       recClients(r).forEach(function(c){if(c.key)info.last[r.guiaId+"|"+c.key]={c:c,rec:r};});
     });
   }).catch(function(){}).then(function(){
-    if(S.step==="setup"){renderDraft();renderGuiaSel();}
-    else if(S.step==="report")renderReport();
+    if(quiet&&syncHasActiveEditor())return;
+    if(S.step==="setup"){if(S.guiaId)renderDraft();else renderHome();}
+    else if(S.step==="report"&&!quiet)renderReport();
   });
 }
-
 function stOf(gid,key){
   var x=info.last[gid+"|"+key];
   if(!x)return {k:"nao",label:"Falta conferir",cls:"none"};
@@ -300,13 +260,14 @@ function cleanClient(c){
 function saveGuia(){
   if(!S.draft.length)return Promise.resolve();
   ensureKeys();if(!S.guiaId)S.guiaId=uid();
-  var rec={id:S.guiaId,kind:"guia",order:(S.orderName||"").trim()||"Sem identificação",ts:Date.now(),date:todayStr(),clients:S.draft.map(cleanClient).filter(function(c){return c.items.length;})};
+  var rec={id:S.guiaId,kind:"guia",order:(S.orderName||"").trim()||"Sem identificação",ts:Date.now(),date:todayStr(),fin:!!(S.guiaFin&&S.guiaFin.fin),finTs:(S.guiaFin&&S.guiaFin.ts)||0,finPor:(S.guiaFin&&S.guiaFin.por)||"",clients:S.draft.map(cleanClient).filter(function(c){return c.items.length;})};
   save();
   return dbPut(rec).then(loadInfo).catch(function(){toast("Não foi possível guardar a guia neste navegador.");});
 }
+function guiaStats(g){var o={n:g.clients.length,ok:0,fa:0,nao:0};g.clients.forEach(function(c){var k=stOf(g.id,c.key).k;if(k==="ok")o.ok++;else if(k==="falta")o.fa++;else o.nao++;});return o;}
 function abrirGuia(id){
   var g=info.guias.filter(function(x){return x.id===id;})[0];if(!g)return;
-  S.guiaId=g.id;S.orderName=g.order;S.editC=-1;S.busca="";S.fil="";
+  S.guiaId=g.id;S.guiaFin={fin:!!g.fin,ts:g.finTs,por:g.finPor};S.pdfMsg=null;S.orderName=g.order;S.editC=-1;S.busca="";S.fil="";S.confirmFinCarga=false;
   S.draft=g.clients.map(function(c){return {key:c.key,code:c.code,name:c.name,fantasia:c.fantasia,address:c.address,obs:c.obs,nfs:c.nfs,expected:c.expected,
     items:c.items.map(function(i){return {code:i.code,name:i.name,qty:String(i.ordered).replace(".",","),unit:i.unit};})};});
   save();render();
@@ -341,8 +302,7 @@ function gateCreate(){
 function sair(){unlocked=false;try{sessionStorage.removeItem(SESS);}catch(e){}S.step=S.items.length?"check":"setup";render();}
 function startup(){
   try{unlocked=!!getSenha()&&sessionStorage.getItem(SESS)==="1";}catch(e){unlocked=false;}
-  render();
-  startSync();
+  render();startSync();
 }
 
 /* conferentes */
@@ -364,52 +324,15 @@ function buildRecord(){
   var ok=clients.every(function(c){return c.items.every(function(i){return i.falta===0;});});
   return {id:S.orderId||uid(),conferente:(S.conferente||"").trim(),date:todayStr(),hora:nowHour(),ts:Date.now(),order:S.orderName||"Sem identificação",guiaId:S.guiaId||"",complete:ok,clients:clients};
 }
-
-/* Envio de resumo legado; sincronização central ocorre em syncPushRecord/syncQueueState. */
-function enviarParaGoogleSheets(rec) {
-  if (!URL_GOOGLE_SCRIPT) return;
-  recClients(rec).forEach(function(c) {
-    var comp = 0, fal = 0;
-    c.items.forEach(function(i) {
-      if (i.falta === 0) comp++; else fal++;
-    });
-    
-    var payload = {
-      acao: "salvar",
-      senha: SENHA_SERVIDOR,
-      ordem: rec.order,
-      cliente: c.name,
-      notasFiscais: c.nfs,
-      situacao: rec.complete ? "Conferido" : "Conferido com falta",
-      produtos: c.items.length,
-      produtosCompletos: comp,
-      produtosComFalta: fal,
-      conferente: rec.conferente,
-      data: brDate(rec.date),
-      hora: rec.hora
-    };
-
-    fetch(URL_GOOGLE_SCRIPT, {
-      method: "POST",
-      mode: "no-cors",
-      headers: { "Content-Type": "text/plain" },
-      body: JSON.stringify(payload)
-    }).catch(function(err){ console.error("Erro ao enviar para Google Sheets:", err); });
-  });
-}
-
 function finalize(){
   var rec=buildRecord(),jobs=[];
   recClients(rec).forEach(function(c){c.items.forEach(function(it){it.regs.forEach(function(r){
     if(typeof r.foto==="string"&&r.foto)jobs.push(fetch(r.foto).then(function(x){return x.blob();}).then(function(b){r.foto=b;}));
   });});});
-  Promise.all(jobs).then(function(){
-    enviarParaGoogleSheets(rec);
-    return dbPut(rec);
-  }).then(function(){
-    S={step:"setup",orderId:"",orderName:S.orderName,conferente:S.conferente,repConf:"",draft:S.draft,guiaId:S.guiaId,items:[],clients:[],openClient:null,editC:-1,busca:"",fil:"",openId:null,zoom:null,confirmReset:false,confirmFinal:false,reportDate:todayStr(),reportTo:todayStr()};
+  Promise.all(jobs).then(function(){enviarParaGoogleSheets(rec);return dbPut(rec);}).then(function(){
+    S={step:"setup",orderId:"",orderName:S.orderName,conferente:S.conferente,repConf:"",draft:S.draft,guiaId:S.guiaId,guiaFin:S.guiaFin,items:[],clients:[],openClient:null,editC:-1,busca:"",fil:"",openId:null,zoom:null,confirmReset:false,confirmFinal:false,reportDate:todayStr(),reportTo:todayStr()};
     save();render();window.scrollTo(0,0);loadInfo();
-    toast("Conferência salva e sincronizada!");
+    toast("Conferência salva e sincronizada.");
   }).catch(function(){
     S.confirmFinal=false;render();
     toast("Não foi possível salvar a carga. Nada foi apagado. Tente de novo.");
@@ -424,12 +347,9 @@ function openReport(){
   S.step="report";S.confirmReset=false;S.confirmFinal=false;S.openId=null;
   loadReport();window.scrollTo(0,0);
 }
-
-function loadReport(){
+function loadReport(quiet){
   var from=S.reportDate||todayStr(),to=S.reportTo||from,tk=++reportToken;
-  report={loading:true,recs:[],err:"",names:[]};
-  render();
-
+  if(!quiet){report={loading:true,recs:[],err:"",names:[]};render();}
   dbAll().then(function(all){
     if(tk!==reportToken)return;
     report.recs=(all||[]).filter(function(r){return r.kind!=="guia"&&r.date>=from&&r.date<=to;}).sort(function(a,b){return a.ts-b.ts;}).map(function(r){
@@ -443,15 +363,14 @@ function loadReport(){
     });
     report.names=report.recs.map(function(r){return r.conf;}).filter(function(n,i,a){return n&&a.indexOf(n)===i;}).sort();
   }).catch(function(){
-    if(tk===reportToken)report.err="Não foi possível ler os dados guardados.";
+    if(tk===reportToken)report.err="Não foi possível ler os dados guardados neste navegador.";
   }).then(function(){
     if(tk!==reportToken)return;
     report.loading=false;
     if(S.step==="report")renderReport();
   });
 }
-
-function shown(){return report.recs.filter(function(r){return !S.repConf||r.conf===S.repConf;});}
+function shown(){return report.recs.filter(function(r){return (!S.repConf||r.conf===S.repConf)&&(!S.repOrd||r.order===S.repOrd);});}
 function nPhotos(r){return r.clients.reduce(function(a,c){return a+c.items.reduce(function(b,i){return b+i.nfotos;},0);},0);}
 function loadCard(r){
   var np=nPhotos(r);
@@ -477,7 +396,9 @@ function renderReport(){
     '<div class="actions" style="margin-top:14px"><div class="field"><label for="repDate">De</label><input class="inp" id="repDate" type="date" value="'+esc(from)+'"></div>'+
     '<div class="field"><label for="repTo">Até</label><input class="inp" id="repTo" type="date" value="'+esc(to)+'"></div></div>'+
     '<div class="field" style="margin-top:10px"><label for="repConf">Conferente</label><select class="inp" id="repConf"><option value="">Todos</option>'+
-    report.names.map(function(n){return '<option value="'+esc(n)+'"'+(S.repConf===n?" selected":"")+'>'+esc(n)+'</option>';}).join("")+'</select></div>';
+    report.names.map(function(n){return '<option value="'+esc(n)+'"'+(S.repConf===n?" selected":"")+'>'+esc(n)+'</option>';}).join("")+'</select></div>'+
+    '<div class="field" style="margin-top:10px"><label for="repOrd">Carga</label><select class="inp" id="repOrd"><option value="">Todas</option>'+
+    report.recs.map(function(r){return r.order;}).filter(function(n,i,a){return a.indexOf(n)===i;}).sort().map(function(n){return '<option value="'+esc(n)+'"'+(S.repOrd===n?" selected":"")+'>'+esc(n)+'</option>';}).join("")+'</select></div>';
   var per=from===to?brDate(from):brDate(from)+" a "+brDate(to);
   if(report.loading)html+='<div class="status" style="margin-top:12px">Carregando cargas...</div>';
   else if(report.err)html+='<div class="banner warn">'+esc(report.err)+'</div>';
@@ -495,7 +416,7 @@ function renderSituacao(tabs){
   var nOk=0,nF=0,nN=0;
   g.clients.forEach(function(c){var k=stOf(g.id,c.key).k;if(k==="ok")nOk++;else if(k==="falta")nF++;else nN++;});
   var vis=g.clients.filter(function(c){return !S.repFil||stOf(g.id,c.key).k===S.repFil;});
-  html+='<div class="field" style="margin-top:10px"><label for="repGuia">Guia</label><select class="inp" id="repGuia">'+info.guias.map(function(x){return '<option value="'+esc(x.id)+'"'+(x.id===g.id?" selected":"")+'>'+esc(x.order)+' - '+esc(brDate(x.date))+'</option>';}).join("")+'</select></div>'+
+  html+='<div class="field" style="margin-top:10px"><label for="repGuia">Guia</label><select class="inp" id="repGuia">'+info.guias.map(function(x){return '<option value="'+esc(x.id)+'"'+(x.id===g.id?" selected":"")+'>'+esc(x.order)+' - '+esc(brDate(x.date))+(x.fin?' (finalizada)':' (em aberto)')+'</option>';}).join("")+'</select></div>'+
     '<div class="field" style="margin-top:10px"><label for="repFil">Mostrar</label><select class="inp" id="repFil"><option value="">Todos os clientes</option><option value="nao"'+(S.repFil==="nao"?" selected":"")+'>Falta conferir</option><option value="falta"'+(S.repFil==="falta"?" selected":"")+'>Conferidos com falta</option><option value="ok"'+(S.repFil==="ok"?" selected":"")+'>Conferidos completos</option></select></div>'+
     '<div class="banner '+(nOk===g.clients.length?"ok":"warn")+'">'+g.clients.length+' clientes: '+nOk+' conferido(s) completo(s), '+nF+' com falta, '+nN+' falta conferir.</div>'+
     vis.map(function(c){
@@ -507,14 +428,14 @@ function renderSituacao(tabs){
         (x?'<div class="hint">Conferido por '+esc(x.rec.conferente||"não informado")+' em '+esc(brDate(x.rec.date))+' '+esc(x.rec.hora)+'</div>':'')+'</summary>'+lines+
         (np?'<div style="margin-top:10px"><button class="btn small ghost" data-act="photos" data-id="'+esc(x.rec.id)+'" type="button">Ver fotos ('+np+')</button></div>':'')+'</details>';
     }).join("")+
-    '<div class="stack" style="margin-top:16px"><button class="btn primary" data-act="download-sit" type="button">Baixar planilha da situação</button><button class="btn" data-act="rback" type="button">Voltar</button></div>';
+    '<div class="stack" style="margin-top:16px"><button class="btn primary" data-act="download-sit" type="button">Baixar planilha desta carga</button><button class="btn" data-act="download-all" type="button">Baixar resumo de todas as cargas</button><button class="btn" data-act="rback" type="button">Voltar</button></div>';
   app.innerHTML=html;
 }
-function downloadSituacao(){
-  var g=guiaSel();if(!g)return;
+function downloadSituacao(all){
+  var gs=all?info.guias:[guiaSel()].filter(Boolean);if(!gs.length)return;
   var linhas=[["Ordem","Cliente","Notas fiscais","Situação do cliente","Produto","Unidade","Qtd. da guia","Qtd. conferida","Falta","Situação do produto","Conferente","Data","Hora"]];
   var resumo=[["Ordem","Cliente","Notas fiscais","Situação do cliente","Produtos","Produtos completos","Produtos com falta","Conferente","Data","Hora"]];
-  g.clients.forEach(function(c){
+  gs.forEach(function(g){g.clients.forEach(function(c){
     var st=stOf(g.id,c.key),x=st.x,rec=x?x.rec:null;
     var its=x?x.c.items:c.items.map(function(i){return {name:i.name,unit:i.unit,ordered:i.ordered,loaded:"",falta:i.ordered};});
     var comp=0,fal=0;
@@ -524,8 +445,8 @@ function downloadSituacao(){
       linhas.push([g.order,c.name,c.nfs,st.k==="nao"?"Falta conferir":(st.k==="ok"?"Conferido":"Conferido com falta"),i.name,i.unit,i.ordered,i.loaded,i.falta,sit,rec?rec.conferente:"",rec?brDate(rec.date):"",rec?rec.hora:""]);
     });
     resumo.push([g.order,c.name,c.nfs,st.k==="nao"?"Falta conferir":(st.k==="ok"?"Conferido":"Conferido com falta"),its.length,x?comp:"",x?fal:"",rec?rec.conferente:"",rec?brDate(rec.date):"",rec?rec.hora:""]);
-  });
-  var base="situacao-"+String(g.order).replace(/[^A-Za-z0-9_-]+/g,"-")+"-"+todayStr();
+  });});
+  var base=all?"situacao-todas-as-cargas-"+todayStr():"situacao-"+String(gs[0].order).replace(/[^A-Za-z0-9_-]+/g,"-")+"-"+todayStr();
   if(window.XLSX){
     var w1=XLSX.utils.aoa_to_sheet(resumo),w2=XLSX.utils.aoa_to_sheet(linhas);
     w1["!cols"]=[{wch:26},{wch:40},{wch:30},{wch:20},{wch:10},{wch:12},{wch:12},{wch:20},{wch:12},{wch:8}];
@@ -578,7 +499,7 @@ function downloadSheet(){
     var wb=XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb,w1,"Conferências");
     XLSX.utils.book_append_sheet(wb,w2,"Total por produto");
-try{XLSX.writeFile(wb,base+".xlsx");toast("Planilha .xlsx gerada.");return;}catch(e){}
+    try{XLSX.writeFile(wb,base+".xlsx");toast("Planilha .xlsx gerada.");return;}catch(e){}
   }
   saveBlob(new Blob([csvOf(linhas)],{type:"text/csv;charset=utf-8"}),base+".csv");
   toast("Planilha .csv gerada. Abre no Excel.");
@@ -655,7 +576,7 @@ function toast(msg){
   clearTimeout(toastTimer);toastTimer=setTimeout(function(){t.hidden=true;},2800);
 }
 
-/* ---------- leitura do PDF ---------- */
+/* ---------- leitura do PDF (guia de entrega, separada por cliente) ---------- */
 function agruparLinhas(items){
   var its=items.slice().sort(function(a,b){return b.y-a.y||a.x-b.x;}),lines=[],cur=null;
   its.forEach(function(it){
@@ -678,6 +599,7 @@ function nfsTexto(nfs){
 function nfsLimpa(str){
   return String(str||"").replace(/\d[\d.]*\d/g,function(m){return m.replace(/\./g,"");});
 }
+/* pages: lista de páginas; cada página é uma lista de {x,y,s} (texto, posição) */
 function parseGuia(pages){
   var out={ordem:"",clientes:[]},cur=null;
   pages.forEach(function(items){
@@ -725,7 +647,7 @@ function parseGuia(pages){
 }
 function readPdf(file){
   var status=document.getElementById("pdfStatus");
-  function say(t,err){if(status){status.textContent=t;status.className="status"+(err?" err":"");}}
+  function say(t,err){status=document.getElementById("pdfStatus")||status;if(status){status.textContent=t;status.className="status"+(err?" err":"");}}
   if(!window.pdfjsLib){say("Não foi possível carregar o leitor de PDF. Adicione os clientes e produtos manualmente.",true);return;}
   setPdfWorker();say("Lendo o PDF...");
   var fr=new FileReader();
@@ -750,12 +672,12 @@ function readPdf(file){
         return {code:c.code,name:c.name,fantasia:c.fantasia,address:c.address,obs:c.obs,nfs:nfsTexto(c.nfs),expected:c.expected,
           items:c.items.map(function(i){return {code:i.code,name:i.name,qty:i.qty,unit:""};})};
       });
-      S.editC=-1;S.guiaId=uid();S.busca="";S.fil="";ensureKeys();
+      S.editC=-1;S.guiaId=uid();S.guiaFin={};S.confirmFinCarga=false;S.busca="";S.fil="";ensureKeys();
       if(g.ordem){S.orderName="Ordem de Carga "+g.ordem;var on=document.getElementById("orderName");if(on)on.value=S.orderName;}
       var np=S.draft.reduce(function(a,c){return a+c.items.length;},0);
       var dif=S.draft.filter(function(c){return c.expected&&c.expected!==c.items.length;}).length;
-      say(S.draft.length+" cliente(s) e "+np+" produto(s) encontrados."+(dif?" "+dif+" cliente(s) com contagem diferente da informada no PDF (marcados abaixo). Confira antes de iniciar.":" A contagem de itens confere com o PDF."),dif>0);
-      renderDraft();saveGuia();
+      S.pdfMsg={t:S.draft.length+" cliente(s) e "+np+" produto(s) encontrados."+(dif?" "+dif+" cliente(s) com contagem diferente da informada no PDF (marcados na lista). Confira antes de conferir.":" A contagem de itens confere com o PDF."),err:dif>0};
+      saveGuia();render();window.scrollTo(0,0);
     }).catch(function(){say("Não foi possível ler este PDF. Adicione os clientes manualmente.",true);});
   };
   fr.readAsArrayBuffer(file);
@@ -787,34 +709,52 @@ function render(){
   renderOverlays();
 }
 
-function renderSetup(){
+function renderSetup(){if(S.guiaId)renderCarga();else renderHome();if(!renderSetup.loaded){renderSetup.loaded=true;loadInfo();}}
+function pdfMsgHtml(){return '<div class="status'+(S.pdfMsg&&S.pdfMsg.err?" err":"")+'" id="pdfStatus" role="status">'+esc(S.pdfMsg?S.pdfMsg.t:"")+'</div>';}
+function dateOf(ts){var d=new Date(ts||Date.now());return d.getFullYear()+"-"+("0"+(d.getMonth()+1)).slice(-2)+"-"+("0"+d.getDate()).slice(-2);}
+function renderHome(){
+  var ab=info.guias.filter(function(g){return !g.fin;}),fi=info.guias.filter(function(g){return g.fin;});
+  var fin=S.homeTab==="fin",lista=fin?fi:ab;
   app.innerHTML=
     '<div class="intro"><div class="eyebrow">Doca de carregamento</div><h1 class="title">Conferência de Carga</h1>'+
-    '<p>Anexe a guia de entrega em PDF. Depois escolha só o cliente que vai conferir.</p></div>'+
-    '<div class="stack" style="margin-top:16px">'+
-    '<button class="btn primary" data-act="pick-pdf" type="button">Anexar PDF da guia de entrega</button>'+
-    '<div class="status" id="pdfStatus" role="status"></div>'+
-    '<div id="guiaSel"></div>'+
-    '<div class="field"><label for="conf">Conferente (quem está conferindo)</label><input class="inp" id="conf" list="confList" autocomplete="off" placeholder="Nome de quem confere" value="'+esc(S.conferente||"")+'"><datalist id="confList">'+nomes().map(function(n){return '<option value="'+esc(n)+'">';}).join("")+'</datalist></div>'+
-    '<div class="field"><label for="orderName">Identificação da ordem</label><input class="inp" id="orderName" placeholder="Ex.: Ordem de Carga 1215904" value="'+esc(S.orderName)+'"></div>'+
-    '</div>'+
-    '<h2 class="sec-title">Clientes da ordem</h2>'+
+    '<p>Anexe a guia de entrega em PDF de cada carga. Depois escolha a carga e o cliente que vai conferir.</p></div>'+
+    '<div class="stack" style="margin-top:16px"><button class="btn primary" data-act="pick-pdf" type="button">Anexar PDF de nova carga</button>'+pdfMsgHtml()+'</div>'+
+    '<div class="actions" style="margin-top:16px"><button class="btn'+(fin?"":" primary")+'" data-act="htab" data-t="abertas" type="button">Para conferir ('+ab.length+')</button><button class="btn'+(fin?" primary":"")+'" data-act="htab" data-t="fin" type="button">Finalizadas ('+fi.length+')</button></div>'+
+    '<div class="stack" style="margin-top:12px">'+
+    (lista.length?lista.map(function(g){
+      var t=guiaStats(g);
+      return '<button class="card '+(fin||(t.ok===t.n&&t.n)?"s-ok":(t.ok+t.fa?"s-warn":"s-none"))+'" data-act="open-guia" data-gid="'+esc(g.id)+'" type="button">'+
+        '<div class="name">'+esc(g.order)+'</div><div class="hint mono">Anexada em '+esc(brDate(g.date))+(g.fin?' · finalizada em '+esc(brDate(dateOf(g.finTs))):'')+'</div>'+
+        '<div class="nums"><div class="big">'+t.ok+' <small>/ '+t.n+' clientes conferidos</small></div><span class="pill '+(t.nao?"none":(t.fa?"warn":"ok"))+'">'+(t.nao?t.nao+' falta conferir':(t.fa?t.fa+' com falta':'Tudo conferido'))+'</span></div>'+
+        '<div class="bar"><i style="width:'+(t.n?Math.round(t.ok/t.n*100):0)+'%"></i></div></button>';
+    }).join(""):'<div class="status">'+(fin?"Nenhuma carga finalizada ainda.":"Nenhuma carga para conferir. Anexe o PDF de uma carga.")+'</div>')+
+    '</div><div class="stack" style="margin-top:16px">'+
+    '<button class="btn ghost" data-act="newcarga" type="button">+ Cadastrar carga manualmente</button>'+
+    '<button class="btn primary" data-act="report" type="button">Relatórios</button>'+
+    '<button class="btn ghost" data-act="ajustes" type="button">Ajustes, senha e cópia de segurança</button></div>';
+}
+function renderCarga(){
+  var fin=!!(S.guiaFin&&S.guiaFin.fin),g=info.guias.filter(function(x){return x.id===S.guiaId;})[0];
+  var t=g?guiaStats(g):null;
+  app.innerHTML=
+    '<div class="intro"><div class="eyebrow">Carga'+(fin?' finalizada':'')+'</div><h1 class="title">'+esc(S.orderName||"Nova carga")+'</h1></div>'+
+    '<div class="stack" style="margin-top:12px"><button class="btn" data-act="voltar-cargas" type="button">&larr; Voltar às cargas</button>'+
+    (fin?'<div class="banner ok">Carga finalizada em '+esc(brDate(dateOf(S.guiaFin.ts)))+(S.guiaFin.por?' por '+esc(S.guiaFin.por):'')+'.</div><button class="btn ghost" data-act="reabrir" type="button">Reabrir carga</button>':
+      '<div class="field"><label for="conf">Conferente (quem está conferindo)</label><input class="inp" id="conf" list="confList" autocomplete="off" placeholder="Nome de quem confere" value="'+esc(S.conferente||"")+'"><datalist id="confList">'+nomes().map(function(n){return '<option value="'+esc(n)+'">';}).join("")+'</datalist></div>'+
+      '<div class="field"><label for="orderName">Identificação da carga</label><input class="inp" id="orderName" placeholder="Ex.: Ordem de Carga 1215904" value="'+esc(S.orderName)+'"></div>')+
+    pdfMsgHtml()+'</div>'+
+    '<h2 class="sec-title">Clientes da carga</h2>'+
     '<div class="actions"><div class="field"><label for="busca">Buscar cliente ou nota fiscal</label><input class="inp" id="busca" autocomplete="off" placeholder="Nome ou número da nota" value="'+esc(S.busca||"")+'"></div>'+
     '<div class="field"><label for="fil">Mostrar</label><select class="inp" id="fil"><option value="">Todos</option><option value="nao"'+(S.fil==="nao"?" selected":"")+'>Falta conferir</option><option value="falta"'+(S.fil==="falta"?" selected":"")+'>Com falta</option><option value="ok"'+(S.fil==="ok"?" selected":"")+'>Conferidos</option></select></div></div>'+
     '<div class="stack" id="draftList" style="margin-top:10px"></div>'+
     '<div class="stack" style="margin-top:12px">'+
-    '<button class="btn ghost" data-act="dc-add" type="button">+ Adicionar cliente</button>'+
-    (S.draft.length?'<button class="btn ghost" data-act="newguia" type="button">Fechar esta guia (fica salva)</button>':'')+
-    '<button class="btn primary" data-act="report" type="button">Relatórios</button>'+
-    '<button class="btn ghost" data-act="ajustes" type="button">Ajustes, senha e cópia de segurança</button></div>';
-  renderDraft();renderGuiaSel();
-  if(!renderSetup.loaded){renderSetup.loaded=true;loadInfo();}
-}
-function renderGuiaSel(){
-  var b=document.getElementById("guiaSel");if(!b)return;
-  if(!info.guias.length){b.innerHTML="";return;}
-  b.innerHTML='<div class="field"><label for="guiaPick">Guias salvas neste computador</label><select class="inp" id="guiaPick"><option value="">Abrir uma guia salva...</option>'+
-    info.guias.map(function(g){return '<option value="'+esc(g.id)+'"'+(S.guiaId===g.id?" selected":"")+'>'+esc(g.order)+' - '+esc(brDate(g.date))+' ('+g.clients.length+' clientes)</option>';}).join("")+'</select></div>';
+    (fin?'':'<button class="btn ghost" data-act="dc-add" type="button">+ Adicionar cliente</button>'+
+      (S.confirmFinCarga?
+        '<div class="banner '+(t&&(t.nao||t.fa)?"warn":"ok")+'" style="margin:0">'+(t&&(t.nao||t.fa)?"Ainda há "+t.nao+" cliente(s) sem conferir e "+t.fa+" com falta. Finalizar a carga assim mesmo?":"Todos os clientes conferidos. Finalizar a carga?")+'</div>'+
+        '<button class="btn primary" data-act="fin-carga-yes" type="button">Sim, finalizar carga</button><button class="btn ghost" data-act="fin-carga-no" type="button">Cancelar</button>':
+        '<button class="btn primary" data-act="fin-carga" type="button">Finalizar carga</button>'))+
+    '<button class="btn" data-act="report" type="button">Relatórios</button></div>';
+  renderDraft();
 }
 function itemRowHtml(d,ci,i){
   var k=ci+"_"+i;
@@ -828,7 +768,7 @@ function renderDraft(){
   var box=document.getElementById("draftList");if(!box)return;
   if(!S.draft.length){box.innerHTML='<div class="status">Nenhum cliente ainda. Anexe o PDF da guia, abra uma guia salva ou adicione manualmente.</div>';return;}
   ensureKeys();
-  var q=nfsLimpa(S.busca||"").trim().toLowerCase(),nOk=0,nF=0,nN=0;
+  var q=nfsLimpa(S.busca||"").trim().toLowerCase(),nOk=0,nF=0,nN=0,isFin=!!(S.guiaFin&&S.guiaFin.fin);
   var rows=S.draft.map(function(c,ci){
     var st=S.guiaId?stOf(S.guiaId,c.key):{k:"nao",label:"Falta conferir",cls:"none"};
     if(st.k==="ok")nOk++;else if(st.k==="falta")nF++;else nN++;
@@ -847,8 +787,8 @@ function renderDraft(){
         '<div class="hint">'+c.items.length+' produto(s)'+(dif?' <span class="err">· o PDF informa '+c.expected+' itens</span>':'')+'</div>'+
         (x?'<div class="hint">Conferido por '+esc(x.rec.conferente||"não informado")+' em '+esc(brDate(x.rec.date))+' '+esc(x.rec.hora)+'</div>':'')+
         '<span class="pill '+st.cls+'" style="margin-top:6px">'+esc(st.label)+'</span></div>'+
-        '<div class="dcl-b"><button class="btn small primary" data-act="conf-client" data-c="'+ci+'" type="button">'+(x?"Conferir de novo":"Conferir")+'</button>'+
-        '<button class="btn small ghost" data-act="dc-toggle" data-c="'+ci+'" type="button">'+(open?"Fechar":"Editar")+'</button></div></div>'+
+        (isFin?'':'<div class="dcl-b"><button class="btn small primary" data-act="conf-client" data-c="'+ci+'" type="button">'+(x?"Conferir de novo":"Conferir")+'</button>'+
+        '<button class="btn small ghost" data-act="dc-toggle" data-c="'+ci+'" type="button">'+(open?"Fechar":"Editar")+'</button></div>')+'</div>'+
         (open?'<div class="stack" style="margin-top:10px">'+
           '<div class="field"><label for="cn'+ci+'">Cliente</label><input class="inp" id="cn'+ci+'" data-c="'+ci+'" data-f="name" value="'+esc(c.name)+'"></div>'+
           '<div class="field"><label for="cf'+ci+'">Notas fiscais (números sem pontos)</label><input class="inp mono" id="cf'+ci+'" data-c="'+ci+'" data-f="nfs" value="'+esc(c.nfs)+'"></div>'+
@@ -1040,13 +980,23 @@ document.addEventListener("click",function(ev){
       S.clients=[{id:cl.key,key:cl.key,code:cl.code,name:cl.name||"Cliente",fantasia:cl.fantasia,address:cl.address,obs:cl.obs,nfs:cl.nfs,expected:cl.expected}];
       S.items=cl.items.map(function(d){return {id:uid(),cid:cl.key,code:d.code,name:d.name,unit:d.unit,ordered:d.ordered,entries:[]};});
       lembrarNome((S.conferente||"").trim());S.orderId=uid();S.step="check";S.openClient=cl.key;S.confirmReset=false;S.confirmFinal=false;
-      saveGuia();save();render();window.scrollTo(0,0);break;
+      save();render();window.scrollTo(0,0);break;
     case "cancel-yes":
       S.clients=[];S.items=[];S.openClient=null;S.orderId="";S.confirmReset=false;S.confirmFinal=false;S.step="setup";save();render();window.scrollTo(0,0);break;
-    case "newguia":
-      S.draft=[];S.guiaId="";S.orderName="";S.editC=-1;S.busca="";S.fil="";save();render();toast("Guia fechada. Ela continua salva em 'Guias salvas'.");break;
+    case "voltar-cargas":
+      saveGuia().then(function(){S.draft=[];S.guiaId="";S.guiaFin={};S.orderName="";S.editC=-1;S.busca="";S.fil="";S.pdfMsg=null;S.confirmFinCarga=false;save();render();window.scrollTo(0,0);});break;
+    case "open-guia":abrirGuia(el.getAttribute("data-gid"));window.scrollTo(0,0);break;
+    case "htab":S.homeTab=el.getAttribute("data-t");renderHome();break;
+    case "newcarga":S.guiaId=uid();S.guiaFin={};S.draft=[];S.orderName="";S.pdfMsg=null;S.editC=-1;save();render();break;
+    case "fin-carga":S.confirmFinCarga=true;render();break;
+    case "fin-carga-no":S.confirmFinCarga=false;render();break;
+    case "fin-carga-yes":
+      S.guiaFin={fin:true,ts:Date.now(),por:(S.conferente||"").trim()};S.confirmFinCarga=false;
+      saveGuia().then(function(){S.draft=[];S.guiaId="";S.guiaFin={};S.orderName="";S.homeTab="fin";save();render();window.scrollTo(0,0);toast("Carga finalizada. Ela está em 'Finalizadas'.");});break;
+    case "reabrir":S.guiaFin={};saveGuia().then(function(){render();toast("Carga reaberta.");});break;
     case "rtab":S.repTab=el.getAttribute("data-t");renderReport();break;
     case "download-sit":downloadSituacao();break;
+    case "download-all":downloadSituacao(true);break;
     case "open-client":S.openClient=el.getAttribute("data-cid");render();window.scrollTo(0,0);break;
     case "back-clients":S.openClient=null;render();window.scrollTo(0,0);break;
     case "open":S.openId=el.getAttribute("data-id");sheet={photo:null,qty:""};renderOverlays();break;
@@ -1127,10 +1077,10 @@ document.getElementById("bkIn").addEventListener("change",function(ev){var f=ev.
 document.addEventListener("change",function(ev){
   var t=ev.target;
   if(t.id==="fil"){S.fil=t.value;renderDraft();}
-  else if(t.id==="guiaPick"&&t.value)abrirGuia(t.value);
   else if(t.id==="orderName")saveGuia();
   else if(t.id==="repGuia"){S.repGuia=t.value;renderReport();}
   else if(t.id==="repFil"){S.repFil=t.value;renderReport();}
+  else if(t.id==="repOrd"){S.repOrd=t.value;renderReport();}
 });
 pdfIn.addEventListener("change",function(){if(pdfIn.files&&pdfIn.files[0])readPdf(pdfIn.files[0]);});
 photoIn.addEventListener("change",function(){
