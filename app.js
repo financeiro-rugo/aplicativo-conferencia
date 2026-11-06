@@ -44,7 +44,7 @@ function apiRequest(path,options){
   options.headers=apiHeaders();
   return fetch(WORKER_URL+path,options).then(function(r){
     return r.json().then(function(data){
-      if(!r.ok)throw new Error(data.erro||data.mensagem||"Falha na comunicação com o servidor");
+      if(!r.ok)throw new Error(data.error||data.erro||data.mensagem||"Falha na comunicação com o servidor");
       return data;
     });
   });
@@ -267,7 +267,7 @@ function gateEnter(){
   if(!p){st.textContent="Digite a senha.";st.className="status err";return;}
   st.textContent="Validando acesso...";st.className="status";
   apiRequest("/login",{method:"POST",body:JSON.stringify({password:p})}).then(function(data){
-    if(data.status!=="sucesso"||!data.token||!data.role)throw new Error("Resposta inválida do login.");
+    if(!data.token||!data.role)throw new Error("Resposta inválida do login.");
     unlock(data.role,data.token);
   }).catch(function(err){
     st.textContent=err.message||"Senha incorreta.";st.className="status err";
