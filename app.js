@@ -72,7 +72,9 @@ function dbPutIfNewer(rec){
     var tx=db.transaction("cargas","readwrite"),st=tx.objectStore("cargas"),done=false,g=st.get(rec.id);
     g.onsuccess=function(){
       var local=g.result;
-      if(!local||Number(rec._syncUpdatedAt||0)>Number(local._syncUpdatedAt||0)){
+      if(local&&local.deleted&&!rec.deleted)return;            /* carga excluída aqui nunca é recriada por cópia vinda do servidor */
+      if(!local||rec.deleted||Number(rec._syncUpdatedAt||0)>Number(local._syncUpdatedAt||0)){
+        if(local&&local.deleted&&rec.deleted)return;
         if(local)recClients(local).forEach(function(c,ci){ /* mantém as fotos que já estão neste aparelho */
           var rc=recClients(rec)[ci];if(!rc)return;
           c.items.forEach(function(it,ii){var ri=rc.items[ii];if(!ri||!it.regs)return;if(!ri.regs||!ri.regs.length)ri.regs=it.regs;});});
@@ -100,13 +102,13 @@ function syncHasActiveEditor(){
 /* depois de receber dados novos: atualiza só as listas, e só nas telas de lista; a conferência em andamento nunca é mexida */
 function syncRefresh(){
   loadInfo(true).then(function(){
-    if(S.step==="report"&&!syncHasActiveEditor())loadReport(true);
+    if(unlocked&&S.step==="report"&&!syncHasActiveEditor())loadReport(true);
   });
 }
-function syncPull(){
-  if(!URL_GOOGLE_SCRIPT||syncBusy||document.hidden)return;
+function syncPull(force){
+  if(!URL_GOOGLE_SCRIPT||(!force&&(syncBusy||document.hidden)))return Promise.resolve();
   syncBusy=true;
-  syncJsonp({acao:"syncList",senha:SENHA_SERVIDOR}).then(function(data){
+  return syncJsonp({acao:"syncList",senha:SENHA_SERVIDOR}).then(function(data){
     if(!data||data.status!=="sucesso")return;
     var changed=0,chain=Promise.resolve();
     (data.records||[]).forEach(function(item){
@@ -247,10 +249,11 @@ function loadInfo(quiet){
     info.gone={};all.forEach(function(r){if(r.deleted&&r.kind==="guia")info.gone[r.id]=1;});
     info.guias=all.filter(function(r){return r.kind==="guia"&&!r.deleted;}).sort(function(a,b){return b.ts-a.ts;});
     info.last={};
-    all.filter(function(r){return !r.deleted&&r.kind!=="guia"&&r.guiaId;}).sort(function(a,b){return a.ts-b.ts;}).forEach(function(r){
+    all.filter(function(r){return !r.deleted&&r.kind!=="guia"&&r.guiaId&&!info.gone[r.guiaId];}).sort(function(a,b){return a.ts-b.ts;}).forEach(function(r){
       recClients(r).forEach(function(c){if(c.key)info.last[r.guiaId+"|"+c.key]={c:c,rec:r};});
     });
   }).catch(function(){}).then(function(){
+    if(!unlocked)return;                                        /* nunca desenha telas por cima do login */
     if(S.guiaId&&info.gone[S.guiaId]&&S.step==="setup"){S.draft=[];S.guiaId="";S.guiaFin={};S.orderName="";S.editC=-1;S.confirmDel=false;save();render();toast("Esta carga foi excluída.");return;}
     if(quiet&&syncHasActiveEditor())return;
     if(S.step==="setup"){if(S.guiaId)renderDraft();else renderHome();}
@@ -258,7 +261,8 @@ function loadInfo(quiet){
   });
 }
 function excluirCargas(guiaId){
-  return dbAll().then(function(all){
+  var espera=new Promise(function(r){setTimeout(r,8000);});
+  return Promise.race([syncPull(true).catch(function(){}),espera]).then(function(){return dbAll();}).then(function(all){
     var alvo=(all||[]).filter(function(r){return !r.deleted&&(!guiaId||(r.kind==="guia"?r.id===guiaId:r.guiaId===guiaId));});
     return alvo.reduce(function(pr,r){return pr.then(function(){return dbPut({id:r.id,kind:r.kind||"",deleted:true,ts:Date.now(),date:r.date||todayStr()});});},Promise.resolve()).then(function(){return alvo.length;});
   });
@@ -278,7 +282,14 @@ function saveGuia(){
   ensureKeys();if(!S.guiaId)S.guiaId=uid();
   var rec={id:S.guiaId,kind:"guia",order:(S.orderName||"").trim()||"Sem identificação",ts:Date.now(),date:todayStr(),fin:!!(S.guiaFin&&S.guiaFin.fin),finTs:(S.guiaFin&&S.guiaFin.ts)||0,finPor:(S.guiaFin&&S.guiaFin.por)||"",clients:S.draft.map(cleanClient).filter(function(c){return c.items.length;})};
   save();
-  return dbPut(rec).then(loadInfo).catch(function(){toast("Não foi possível guardar a guia neste navegador.");});
+  return dbGet(rec.id).then(function(old){
+    if(old&&old.deleted)return loadInfo();                       /* foi excluída (talvez em outro aparelho): não recria */
+    if(old&&!old.deleted){
+      var a=JSON.stringify([old.order,!!old.fin,old.finTs||0,old.finPor||"",old.clients]),b=JSON.stringify([rec.order,rec.fin,rec.finTs,rec.finPor,rec.clients]);
+      if(a===b)return;                                             /* nada mudou: não mexe no que outro aparelho possa ter alterado */
+    }
+    return dbPut(rec).then(loadInfo);
+  }).catch(function(){toast("Não foi possível guardar a guia neste navegador.");});
 }
 function guiaStats(g){var o={n:g.clients.length,ok:0,fa:0,nao:0};g.clients.forEach(function(c){var k=stOf(g.id,c.key).k;if(k==="ok")o.ok++;else if(k==="falta")o.fa++;else o.nao++;});return o;}
 function abrirGuia(id){
@@ -359,7 +370,8 @@ function loadReport(quiet){
   if(!quiet){report={loading:true,recs:[],err:"",names:[]};render();}
   dbAll().then(function(all){
     if(tk!==reportToken)return;
-    report.recs=(all||[]).filter(function(r){return !r.deleted&&r.kind!=="guia"&&r.date>=from&&r.date<=to;}).sort(function(a,b){return a.ts-b.ts;}).map(function(r){
+    var gone={};(all||[]).forEach(function(r){if(r.deleted&&r.kind==="guia")gone[r.id]=1;});
+    report.recs=(all||[]).filter(function(r){return !r.deleted&&r.kind!=="guia"&&!(r.guiaId&&gone[r.guiaId])&&r.date>=from&&r.date<=to;}).sort(function(a,b){return a.ts-b.ts;}).map(function(r){
       var cls=recClients(r).map(function(c){
         return {name:c.name||"",fantasia:c.fantasia||"",nfs:c.nfs||"",items:c.items.map(function(i){
           return {name:i.name,unit:i.unit||"",ordered:i.ordered,loaded:i.loaded,falta:i.falta,nfotos:(i.regs||[]).filter(function(x){return x.foto;}).length};
@@ -374,7 +386,7 @@ function loadReport(quiet){
   }).then(function(){
     if(tk!==reportToken)return;
     report.loading=false;
-    if(S.step==="report")renderReport();
+    if(unlocked&&S.step==="report")renderReport();
   });
 }
 function shown(){return report.recs.filter(function(r){return (!S.repConf||r.conf===S.repConf)&&(!S.repOrd||r.order===S.repOrd);});}
